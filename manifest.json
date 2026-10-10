@@ -1,0 +1,19 @@
+{
+  "id": "/",
+  "name": "Side B — Your music mix",
+  "short_name": "Side B",
+  "description": "A personal mix of familiar Spotify favorites and new discoveries.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#10110f",
+  "theme_color": "#10110f",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

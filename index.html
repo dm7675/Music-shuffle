@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#10110f">
+    <meta name="description" content="A personal music mix with familiar favorites and new discoveries.">
+    <meta name="mobile-web-app-capable" content="yes">
+    <link rel="manifest" href="manifest.json">
+    <link rel="icon" href="icon.svg" type="image/svg+xml">
+    <title>Side B — Your next favorite is in here</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Main navigation">
+        <a class="brand" href="#" aria-label="Side B home">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 32 32"><path d="M7 22.5 15.5 6l2.8 7.2L25 9l-8.5 17-3-7.2L7 22.5Z" fill="currentColor"/><circle cx="16" cy="16" r="14" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+          </span>
+          <span>side<span class="brand-light">b</span></span>
+        </a>
+
+        <div class="nav-label">YOUR SPACE</div>
+        <nav class="nav-list">
+          <button class="nav-item active" data-view="mix" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h6l10 14h-6L4 5Zm0 14 5-7m5-7h6v6m-6 8h6v-6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span>Your mix</span>
+          </button>
+          <button class="nav-item" data-view="discoveries" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2.2 6.8L21 12l-6.8 2.2L12 21l-2.2-6.8L3 12l6.8-2.2L12 3Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+            <span>Discovered</span>
+            <span class="nav-count" id="discovery-count">0</span>
+          </button>
+          <button class="nav-item" data-view="saved" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.8A1.8 1.8 0 0 1 7.8 3h8.4A1.8 1.8 0 0 1 18 4.8V21l-6-3.7L6 21V4.8Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+            <span>Saved mixes</span>
+          </button>
+        </nav>
+
+        <div class="sidebar-bottom">
+          <div class="car-card">
+            <div class="car-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 11 1.6-4.2A2.8 2.8 0 0 1 9.2 5h5.6a2.8 2.8 0 0 1 2.6 1.8L19 11m-14 0h14a2 2 0 0 1 2 2v4H3v-4a2 2 0 0 1 2-2Zm1 6v2m12-2v2M6 14h.5m11 0h.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+            <strong>Road-ready</strong>
+            <p>Make a mix before you drive. Pick it up in Spotify on Android Auto.</p>
+            <span class="car-note"><span class="status-dot"></span> Android Auto companion</span>
+          </div>
+          <button class="profile-button" id="profile-button" type="button">
+            <span class="avatar">D</span>
+            <span class="profile-copy"><strong>Music explorer</strong><small>Local demo</small></span>
+            <svg class="chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </div>
+      </aside>
+
+      <main class="main-content">
+        <header class="topbar">
+          <div class="breadcrumb"><span>YOUR SPACE</span><span class="breadcrumb-slash">/</span><strong id="page-label">YOUR MIX</strong></div>
+          <div class="topbar-actions">
+            <span class="demo-pill" id="connection-status"><span class="status-dot"></span> SAMPLE DATA</span>
+            <button class="spotify-connect" id="connect-button" type="button">
+              <span class="spotify-symbol" aria-hidden="true">●</span>
+              <span>Connect Spotify</span>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+          </div>
+        </header>
+
+        <section class="view-panel" id="mix-view">
+          <section class="welcome-row">
+            <div>
+              <p class="eyebrow"><span class="eyebrow-line"></span> YOUR LISTENING, REIMAGINED</p>
+              <h1>Your next favorite<br>is <span>in here.</span></h1>
+              <p class="welcome-copy">A little of what you love. A little you haven't heard yet.<br>One good mix for wherever the road goes.</p>
+            </div>
+            <div class="hero-art" aria-hidden="true">
+              <div class="orbit orbit-one"></div><div class="orbit orbit-two"></div>
+              <div class="hero-sun"></div>
+              <div class="hero-disc"><span class="disc-label">SIDE<br>B</span></div>
+              <div class="hero-spark spark-one">✳</div><div class="hero-spark spark-two">✳</div>
+              <span class="art-caption">PLAY THE<br>UNEXPECTED</span>
+            </div>
+          </section>
+
+          <section class="mix-builder" aria-labelledby="builder-title">
+            <div class="builder-heading">
+              <div><p class="eyebrow small-eyebrow">BUILD YOUR NEXT DRIVE</p><h2 id="builder-title">Tune your mix</h2></div>
+              <span class="step-label"><span>01</span> / 02</span>
+            </div>
+
+            <div class="builder-controls">
+              <div class="period-control">
+                <span class="control-label">LISTENING WINDOW</span>
+                <div class="segmented" role="group" aria-label="Listening window">
+                  <button type="button" data-period="day" aria-pressed="false">Day</button>
+                  <button type="button" data-period="week" aria-pressed="false">Week</button>
+                  <button type="button" data-period="month" class="selected" aria-pressed="true">Month</button>
+                </div>
+                <span class="control-hint" id="period-hint">Your recent favorites</span>
+              </div>
+              <div class="duration-control">
+                <div class="duration-label-row"><label class="control-label" for="playlist-length">PLAYLIST LENGTH</label><span class="duration-value" id="duration-value">45 min</span></div>
+                <input id="playlist-length" type="range" min="15" max="120" step="15" value="45" aria-label="Playlist length in minutes">
+                <div class="duration-legend"><span>15 min</span><span>2 hours</span></div>
+              </div>
+              <div class="mix-ratio-control">
+                <div class="ratio-label-row"><span class="control-label">THE FAMILIAR / THE NEW</span><span class="ratio-value" id="ratio-value">65% <span>familiar</span></span></div>
+                <div class="range-wrap">
+                  <span class="range-caption">FAMILIAR</span>
+                  <input id="mix-ratio" type="range" min="20" max="80" step="5" value="65" aria-label="Familiar songs percentage">
+                  <span class="range-caption">NEW</span>
+                </div>
+                <div class="range-legend"><span>A few new turns</span><span>Surprise me</span></div>
+              </div>
+              <button class="generate-button" id="generate-button" type="button">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10m-6-3 3 3-3 3M20 17H10m6-3-3 3 3 3M14 7l-4 10" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                <span>Make my mix</span>
+                <span class="button-arrow">↗</span>
+              </button>
+            </div>
+          </section>
+
+          <section class="playlist-section" aria-labelledby="playlist-title">
+            <div class="playlist-heading">
+              <div class="playlist-title-group">
+                <div class="mix-cover" aria-hidden="true"><span>side<br><b>b</b></span><i></i></div>
+                <div><p class="eyebrow small-eyebrow" id="mix-kicker">MADE FOR YOUR MONTH</p><h2 id="playlist-title">The Long Way Home</h2><p class="playlist-meta"><span id="track-count">12 tracks</span><span class="meta-dot">·</span><span id="mix-runtime">45 min target</span><span class="meta-dot">·</span><span id="mix-date">Just now</span></p></div>
+              </div>
+              <div class="playlist-actions">
+                <button class="icon-button" id="shuffle-button" type="button" aria-label="Shuffle this mix" title="Shuffle this mix"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 3h5v5m-1-4-6 6M4 7h3c4 0 6 10 10 10h4m-5-4 5 4-5 4M4 17h3c1.4 0 2.5-1 3.5-2.3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+                <button class="save-button" id="save-button" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.8A1.8 1.8 0 0 1 7.8 3h8.4A1.8 1.8 0 0 1 18 4.8V21l-6-3.7L6 21V4.8Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg><span>Save mix</span></button>
+                <button class="play-all-button" id="play-all-button" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 12 7-12 7V5Z" fill="currentColor"/></svg><span>Play mix</span></button>
+              </div>
+            </div>
+            <div class="track-table">
+              <div class="track-table-head"><span>#</span><span>TRACK</span><span class="type-col">WHY IT'S HERE</span><span class="duration-heading"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 7v5l3 2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></span></div>
+              <div id="track-list" class="track-list" aria-live="polite"></div>
+            </div>
+          </section>
+          <footer class="page-footer"><span>MADE FOR THE MOMENTS BETWEEN HERE AND THERE.</span><span id="data-source-label">SAMPLE TRACKS · PLAYBACK SIMULATED</span></footer>
+        </section>
+
+        <section class="view-panel hidden" id="collection-view">
+          <div class="collection-header"><p class="eyebrow"><span class="eyebrow-line"></span> KEEP THE GOOD ONES</p><h1 id="collection-title">Your discoveries.</h1><p id="collection-description">Songs you listened to at least 60% of the way through.</p></div>
+          <div class="collection-tools"><span id="collection-count">0 tracks saved</span><button id="clear-collection" class="text-button" type="button">Clear history</button></div>
+          <div id="collection-list" class="collection-list"></div>
+          <div id="collection-empty" class="empty-state"><div class="empty-star">✳</div><h2 id="empty-state-title">Every favorite starts somewhere.</h2><p id="empty-state-copy">Play a track from your mix. When you reach 60%, we'll save it here so you can come back to it.</p><button class="secondary-button" id="back-to-mix" type="button">Back to your mix</button></div>
+        </section>
+      </main>
+    </div>
+
+    <div class="player-bar" id="player-bar">
+      <div class="now-playing">
+        <div class="mini-cover" id="player-cover"><span>✳</span></div>
+        <div class="now-playing-copy"><strong id="player-track">Pick a track</strong><span id="player-artist">Your mix is ready</span></div>
+        <button class="player-heart" id="player-heart" type="button" aria-label="Like this track">♡</button>
+      </div>
+      <div class="playback-controls">
+        <div class="control-buttons">
+          <button type="button" id="previous-button" aria-label="Previous track"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5v14m12-14L7 12l11 7V5Z" fill="currentColor"/></svg></button>
+          <button type="button" class="main-play" id="player-play-button" aria-label="Play"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 12 7-12 7V5Z" fill="currentColor"/></svg></button>
+          <button type="button" id="next-button" aria-label="Next track"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 5v14M6 5l11 7-11 7V5Z" fill="currentColor"/></svg></button>
+        </div>
+        <div class="progress-row"><span id="current-time">0:00</span><div class="progress-track"><div id="progress-fill"></div></div><span id="duration-time">0:00</span></div>
+      </div>
+      <div class="player-extra"><span class="demo-playback"><span class="equalizer"><i></i><i></i><i></i></span><span id="playback-status-label">DEMO PLAYBACK</span></span><button id="queue-button" type="button" aria-label="Open queue"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 11h16M4 16h10m3 0 3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div>
+    </div>
+
+    <dialog id="info-dialog" class="info-dialog">
+      <button class="dialog-close" id="dialog-close" type="button" aria-label="Close">×</button>
+      <div class="dialog-icon">♫</div>
+      <p class="eyebrow small-eyebrow">YOUR ACCOUNT, YOUR MIXES</p>
+      <h2 id="dialog-title">Connect your Spotify.</h2>
+      <p id="dialog-description">Create a Spotify developer app, then paste its Client ID here. Sign-in uses Spotify's PKCE flow; this app never asks for your Spotify password or a client secret.</p>
+      <label class="client-id-label" for="client-id-input">SPOTIFY CLIENT ID</label>
+      <input class="client-id-input" id="client-id-input" type="text" inputmode="text" autocomplete="off" spellcheck="false" placeholder="Paste your Client ID">
+      <div class="redirect-box"><span>REGISTER THIS REDIRECT URI IN YOUR SPOTIFY APP</span><code id="redirect-uri"></code><button class="copy-redirect" id="copy-redirect" type="button">Copy</button></div>
+      <a class="spotify-doc-link" href="https://developer.spotify.com/dashboard" target="_blank" rel="noreferrer">Open Spotify Developer Dashboard ↗</a>
+      <div class="dialog-note"><strong>Spotify development access</strong><span>Spotify currently requires the app owner to have Premium; development-mode apps are limited to five allowlisted users. Track recommendations and accurate 60% play-progress tracking aren't available through this companion web app.</span></div>
+      <div class="dialog-buttons"><button class="dialog-done" id="dialog-done" type="button">Save Client ID</button><button class="dialog-connect" id="dialog-connect" type="button">Save &amp; connect</button></div>
+    </dialog>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>
