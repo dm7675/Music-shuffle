@@ -5,6 +5,24 @@ const { URL } = require("node:url");
 
 const root = __dirname;
 const port = Number(process.env.PORT || 4173);
+const renderHostname = process.env.RENDER_EXTERNAL_HOSTNAME;
+const configuredOrigin = process.env.PUBLIC_ORIGIN || (renderHostname ? `https://${renderHostname}` : "");
+let publicOrigin = "";
+if (configuredOrigin) {
+  let parsedOrigin;
+  try {
+    parsedOrigin = new URL(configuredOrigin);
+  } catch {
+    throw new Error("PUBLIC_ORIGIN must be a valid HTTPS origin, such as https://side-b.onrender.com");
+  }
+  if (parsedOrigin.protocol !== "https:" || parsedOrigin.username || parsedOrigin.password || parsedOrigin.pathname !== "/" || parsedOrigin.search || parsedOrigin.hash) {
+    throw new Error("PUBLIC_ORIGIN must be an HTTPS origin without a path, query, or fragment");
+  }
+  publicOrigin = parsedOrigin.origin;
+}
+const expectedOrigin = publicOrigin || `http://127.0.0.1:${port}`;
+const expectedHost = new URL(expectedOrigin).host;
+const bindHost = publicOrigin ? "0.0.0.0" : "127.0.0.1";
 const types = {
   ".css": "text/css; charset=utf-8",
   ".html": "text/html; charset=utf-8",
@@ -85,8 +103,8 @@ async function proxySpotify(request, response, requestUrl) {
 }
 
 http.createServer(async (request, response) => {
-  if (request.headers.host !== `127.0.0.1:${port}`) {
-    reject(response, 403, "This development server is restricted to 127.0.0.1");
+  if (request.headers.host !== expectedHost) {
+    reject(response, 403, "This server only accepts requests for its configured origin");
     return;
   }
 
@@ -99,7 +117,7 @@ http.createServer(async (request, response) => {
   }
 
   const origin = request.headers.origin;
-  if (origin && origin !== `http://127.0.0.1:${port}`) {
+  if (origin && origin !== expectedOrigin) {
     reject(response, 403, "Cross-origin requests are not allowed");
     return;
   }
@@ -135,6 +153,6 @@ http.createServer(async (request, response) => {
       "Referrer-Policy": "no-referrer"
     }).end(content);
   });
-}).listen(port, "127.0.0.1", () => {
-  console.log(`Side B is running at http://127.0.0.1:${port}/`);
+}).listen(port, bindHost, () => {
+  console.log(`Side B is running on ${bindHost}:${port}`);
 });

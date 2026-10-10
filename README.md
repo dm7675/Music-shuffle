@@ -10,6 +10,19 @@ Side B makes a shuffled playlist from Spotify listening data, then saves it to S
 
 The local development version is only reachable from this computer. To use Side B on your Android phone, it needs to be deployed to an HTTPS web host, and that hosted URL must be added to the Spotify app's Redirect URIs. This project includes a web-app manifest, icon, and service worker; after it is deployed, open the hosted address in Chrome and choose **Install app** or **Add to Home screen**. The current website is not a Play Store Android app or a standalone Android Auto app; saved Spotify playlists can be played in Spotify through Android Auto. The service worker caches only the app shell and never caches Spotify API requests.
 
+## Host on Render
+
+This app needs a Node.js web service: static-only hosting such as GitHub Pages cannot run the Spotify API proxy.
+
+1. In Render, create a **Web Service** and connect this GitHub repository.
+2. Set the build command to `npm install` and the start command to `npm start`.
+3. Render supplies the assigned service hostname at runtime; Side B uses it as its allowed HTTPS origin and binds to Render's network interface. If you use a custom domain, add an environment variable named `PUBLIC_ORIGIN` with exactly that HTTPS origin (for example, `https://music.example.com`, with no trailing path) and redeploy.
+4. In Spotify Developer Dashboard, add `https://your-service.onrender.com/` as a Redirect URI, replacing it with your exact Render address.
+5. Open the Render HTTPS address, select **Connect Spotify**, and enter your Spotify app's Client ID. Client IDs are stored per browser, so connect separately on your phone.
+6. On Android, open the address in Chrome, sign in to Spotify, then use Chrome's **Install app** or **Add to Home screen** option. Save a mix to Spotify and play that Spotify playlist through Android Auto.
+
+For a custom domain, `PUBLIC_ORIGIN` must be the exact public HTTPS origin; do not set it to `*` or expose the local development server. The Spotify development-mode Premium and allowlist limits still apply.
+
 ## Connect a Spotify account
 
 1. Sign in to the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard) and create an app with Web API access.
