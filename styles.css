@@ -138,7 +138,7 @@ input[type="range"]::-moz-range-thumb { width: 9px; height: 9px; border: 2px sol
 .icon-button { width: 34px; display: grid; place-items: center; background: transparent; border: 1px solid #343830; color: #bec1b7; }
 .icon-button:hover, .save-button:hover { border-color: #626957; background: #22251f; }
 .icon-button svg { width: 16px; }
-.save-button { display: flex; align-items: center; gap: 6px; padding: 0 10px; border: 1px solid #343830; color: #d5d7ce; background: transparent; font-size: 9px; }
+.save-button { display: flex; align-items: center; gap: 6px; padding: 0 10px; border: 1px solid #343830; color: #d5d7ce; background: transparent; font-size: 9px; text-decoration: none; }
 .save-button svg { width: 14px; }
 .save-button.saved { color: var(--lime); border-color: #596446; }
 .play-all-button { display: flex; align-items: center; gap: 7px; padding: 0 11px; border: 0; background: var(--lime); color: #181b13; font: 700 9px "Space Grotesk", sans-serif; }
@@ -328,18 +328,22 @@ input[type="range"]::-moz-range-thumb { width: 9px; height: 9px; border: 2px sol
   .track-remove { opacity: 1; }
   .search-result { align-items: flex-start; flex-direction: column; }
   .page-footer { gap: 8px; font-size: 6px; }
-  .player-bar { height: 68px; grid-template-columns: minmax(120px, 1fr) 90px; padding-inline: 12px; }
+  .player-bar { height: 76px; grid-template-columns: minmax(0, 1fr) 126px; padding-inline: 10px; }
   .now-playing { gap: 7px; }
   .mini-cover { width: 34px; height: 34px; }
   .now-playing-copy strong { font-size: 9px; }
   .now-playing-copy span { font-size: 8px; }
   .player-heart { display: none; }
-  .playback-controls { width: 90px; }
-  .control-buttons { gap: 12px; }
-  .control-buttons button:not(.main-play) { display: none; }
+  .playback-controls { width: 126px; }
+  .control-buttons { gap: 11px; }
+  .control-buttons button:not(.main-play) { display: grid; }
   .progress-row { gap: 4px; }
   .progress-row > span { display: none; }
   .player-extra { display: none; }
+  .track-index { display: none; }
+  .row-play { display: block; width: 20px; height: 20px; }
+  .track-like { opacity: 1; }
+  .track-remove { opacity: 1; }
   .collection-header { padding-top: 40px; }
   .collection-header h1 { font-size: 36px; }
   .collection-header > p:last-child { line-height: 1.6; }

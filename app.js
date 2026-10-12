@@ -598,6 +598,13 @@ function renderPlaylist() {
     : state.spotifyUser ? "Export to Spotify" : "Save mix";
   $("#save-local-button").classList.toggle("hidden", !state.spotifyUser);
   $("#save-local-button").textContent = state.currentSavedMixId ? "Update in Side B" : "Save in Side B";
+  const openSpotifyLink = $("#open-spotify-playlist");
+  openSpotifyLink.classList.toggle("hidden", !state.spotifyPlaylist?.id);
+  if (state.spotifyPlaylist?.id) {
+    openSpotifyLink.href = `https://open.spotify.com/playlist/${encodeURIComponent(state.spotifyPlaylist.id)}`;
+  } else {
+    openSpotifyLink.removeAttribute("href");
+  }
   $("#play-all-button").querySelector("span").textContent = state.spotifyPlaylist
     ? "Play on Spotify"
     : "Play mix";
