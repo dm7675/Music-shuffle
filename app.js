@@ -598,6 +598,9 @@ function renderPlaylist() {
     : state.spotifyUser ? "Export to Spotify" : "Save mix";
   $("#save-local-button").classList.toggle("hidden", !state.spotifyUser);
   $("#save-local-button").textContent = state.currentSavedMixId ? "Update in Side B" : "Save in Side B";
+  $("#play-all-button").querySelector("span").textContent = state.spotifyPlaylist
+    ? "Play on Spotify"
+    : "Play mix";
 }
 
 function createTrackRow(track, index, collection, collectionType = "") {
@@ -1249,17 +1252,32 @@ function stopPlayback() {
   $("#player-play-button").innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 12 7-12 7V5Z" fill="currentColor"/></svg>';
 }
 
-async function startSpotifyPlayback(index) {
+async function getSpotifyPlaybackDevice() {
+  const result = await spotifyRequest("/me/player/devices");
+  const devices = result.devices || [];
+  const device = devices.find((candidate) => candidate.is_active && !candidate.is_restricted)
+    || devices.find((candidate) => !candidate.is_restricted);
+  if (device) return device.id;
+  if (devices.length) {
+    throw new Error("Spotify has no controllable playback device available. Open Spotify on your phone or computer and make sure it is online.");
+  }
+  throw new Error("Spotify reports no playback devices. Open the Spotify app on your phone or computer, start a song once, leave Spotify open, then try again. Side B controls Spotify; it does not stream audio itself.");
+}
+
+async function startSpotifyPlayback(index, playlistUri = null) {
   if (!state.spotifyUser) throw new Error("Connect Spotify before starting full-track playback.");
   const uris = state.playlist.map((track) => track.spotifyUri);
-  if (!uris.length || uris.some((uri) => !uri)) {
+  if (!playlistUri && (!uris.length || uris.some((uri) => !uri))) {
     throw new Error("Every song in this mix needs a Spotify match for full-track playback.");
   }
+  const deviceId = await getSpotifyPlaybackDevice();
   if (state.remoteTimer) window.clearInterval(state.remoteTimer);
   state.remoteTimer = null;
-  await spotifyRequest("/me/player/play", {
+  await spotifyRequest(`/me/player/play?device_id=${encodeURIComponent(deviceId)}`, {
     method: "PUT",
-    body: JSON.stringify({ uris, offset: { position: index } })
+    body: JSON.stringify(playlistUri
+      ? { context_uri: playlistUri }
+      : { uris, offset: { position: index } })
   });
   state.activeIndex = index;
   state.elapsed = 0;
@@ -1512,6 +1530,7 @@ async function saveMix() {
         state.saved = nextSaved;
         state.currentSavedMixId = snapshot.id;
       }
+      renderPlaylist();
       $("#save-button").classList.add("saved");
       button.querySelector("span").textContent = "Exported to Spotify";
       if (unmatched.length) {
@@ -1691,7 +1710,16 @@ $("#shuffle-button").addEventListener("click", () => {
 });
 $("#save-button").addEventListener("click", saveMix);
 $("#save-local-button").addEventListener("click", saveMixLocally);
-$("#play-all-button").addEventListener("click", () => playTrack(0));
+$("#play-all-button").addEventListener("click", () => {
+  if (state.spotifyPlaylist?.uri) {
+    void startSpotifyPlayback(0, state.spotifyPlaylist.uri).catch((error) => {
+      showToast(`Couldn't play the saved Spotify playlist: ${error.message}`);
+      console.error("Saved Spotify playlist playback could not start.", error);
+    });
+  } else {
+    playTrack(0);
+  }
+});
 $("#add-songs-button").addEventListener("click", openTrackSearch);
 $("#export-playlist-button").addEventListener("click", exportPlaylistFile);
 $("#export-csv-button").addEventListener("click", exportPlaylistCsv);
