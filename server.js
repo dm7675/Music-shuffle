@@ -5,6 +5,7 @@ const path = require("node:path");
 const { URL } = require("node:url");
 
 const root = __dirname;
+const defaultSpotifyClientId = "a2dd74d7ba8c439191d270fad6d2801a";
 const localEnvPath = path.join(root, ".env");
 if (fs.existsSync(localEnvPath)) {
   const localEnvironment = fs.readFileSync(localEnvPath, "utf8");
@@ -88,7 +89,7 @@ function sendProviderConfig(response) {
   }
 
   const config = {
-    spotify: { clientId: process.env.SPOTIFY_CLIENT_ID || "" },
+    spotify: { clientId: process.env.SPOTIFY_CLIENT_ID || defaultSpotifyClientId },
     appleMusic,
     tidal: {
       clientId: process.env.TIDAL_CLIENT_ID || "",

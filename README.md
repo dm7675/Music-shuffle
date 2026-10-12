@@ -18,7 +18,7 @@ This app needs a Node.js web service: static-only hosting such as GitHub Pages c
 2. Set the build command to `npm install` and the start command to `npm start`.
 3. Render supplies the assigned service hostname at runtime; Side B uses it as its allowed HTTPS origin and binds to Render's network interface. If you use a custom domain, add an environment variable named `PUBLIC_ORIGIN` with exactly that HTTPS origin (for example, `https://music.example.com`, with no trailing path) and redeploy.
 4. In Spotify Developer Dashboard, add `https://your-service.onrender.com/` as a Redirect URI, replacing it with your exact Render address.
-5. Set `SPOTIFY_CLIENT_ID` in Render's private environment settings. It is an OAuth app identifier, not a secret; the app returns it to browsers for Spotify sign-in. If it is not set, each browser can still enter its own Spotify Client ID when connecting.
+5. `SPOTIFY_CLIENT_ID` is optional; the server has a default public Client ID for Side B. Set the variable in Render's environment settings only if you need to override that default. A Client ID is an OAuth app identifier, not a secret; the app returns it to browsers for Spotify sign-in.
 6. On Android, open the address in Chrome, sign in to Spotify, then use Chrome's **Install app** or **Add to Home screen** option. Save a mix to Spotify and play that Spotify playlist through Android Auto.
 
 For a custom domain, `PUBLIC_ORIGIN` must be the exact public HTTPS origin; do not set it to `*` or expose the local development server. The Spotify development-mode Premium and allowlist limits still apply.
@@ -27,7 +27,7 @@ For a custom domain, `PUBLIC_ORIGIN` must be the exact public HTTPS origin; do n
 
 1. Sign in to the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard) and create an app with Web API access.
 2. In the app's settings, add this exact Redirect URI: `http://127.0.0.1:4173/`
-3. For a shared deployment, set the app's Client ID (not a client secret) as `SPOTIFY_CLIENT_ID` in the server environment. For local development, the server reads values from the ignored `.env` file if present, or the Client ID can be entered in Side B when prompted.
+3. For a shared deployment, the server supplies Side B's default Client ID. To override it, set `SPOTIFY_CLIENT_ID` in the server environment. For local development, the server reads values from the ignored `.env` file if present, and the Spotify Client ID can also be entered in Side B when no server value is available.
 4. In Side B, select **Connect Spotify** and approve the requested permissions.
 
 Side B uses Spotify Authorization Code with PKCE. It does not use or store a Spotify client secret. A per-browser Client ID is stored in local browser storage when used; for a shared deployment, the app can instead use `SPOTIFY_CLIENT_ID` from the server environment. Local `.env` values are not committed to source control. Access and refresh tokens are kept in session storage for the current tab; signing out or closing the tab ends the local session. The same-origin server proxy forwards requests to Spotify and configured providers; it rejects other hostnames and cross-origin requests. Keep the local development server bound to localhost and do not expose it to a public network.
