@@ -48,7 +48,7 @@ async function proxySpotify(request, response, requestUrl) {
     : "api.spotify.com";
   const methodAllowed = requestUrl.pathname === "/spotify/token"
     ? request.method === "POST"
-    : ["GET", "POST"].includes(request.method);
+    : ["GET", "POST", "PUT"].includes(request.method);
   if (!methodAllowed) {
     reject(response, 405, "Method not allowed");
     return;

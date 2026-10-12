@@ -23,25 +23,47 @@ const tracks = [
 ];
 
 const periodLabels = { day: "Today", week: "This week", month: "This month" };
-const storageKeys = { discoveries: "sideb-discoveries-v1", saved: "sideb-saved-v1", likes: "sideb-likes-v1", clientId: "sideb-spotify-client-id-v1" };
+const storageKeys = {
+  discoveries: "sideb-discoveries-v1",
+  saved: "sideb-saved-v1",
+  likes: "sideb-likes-v1",
+  clientId: "sideb-spotify-client-id-v1",
+  held: "sideb-held-v1",
+  heard: "sideb-heard-v1",
+  seeds: "sideb-seeds-v1"
+};
 const spotifyTokenKey = "sideb-spotify-session-v1";
 const spotifyScopes = [
   "user-read-private",
   "user-top-read",
   "user-read-recently-played",
+  "user-read-playback-state",
+  "user-modify-playback-state",
+  "playlist-read-private",
+  "playlist-read-collaborative",
   "playlist-modify-private"
 ];
 const state = {
   period: "month",
   ratio: 65,
+  lengthMode: "duration",
   durationMinutes: 45,
+  trackCountTarget: 12,
   playlist: [],
   saved: readStorage(storageKeys.saved, []),
   discoveries: readStorage(storageKeys.discoveries, []),
   liked: readStorage(storageKeys.likes, []),
+  held: readStorage(storageKeys.held, {}),
+  heard: readStorage(storageKeys.heard, []),
+  seedTracks: readStorage(storageKeys.seeds, []),
+  seedMode: "keep",
   activeIndex: -1,
   elapsed: 0,
   timer: null,
+  remoteTimer: null,
+  remotePlayback: false,
+  lastRemoteTrackId: null,
+  currentSavedMixId: null,
   currentView: "mix",
   spotifyUser: null,
   spotifyError: null,
@@ -75,6 +97,71 @@ function writeStorage(key, value) {
     return false;
   }
   return true;
+}
+
+function isTrackUnavailable(track) {
+  const entry = state.held[track.id];
+  if (entry?.blocked) return true;
+  return Boolean(entry && Date.parse(entry.heldUntil) > Date.now());
+}
+
+function markTrackHeard(track) {
+  if (!track?.id) return;
+  if (!state.heard.includes(track.id)) {
+    const nextHeard = [...state.heard, track.id];
+    if (!writeStorage(storageKeys.heard, nextHeard)) return;
+    state.heard = nextHeard;
+  }
+  const nextHeld = { ...state.held };
+  if (nextHeld[track.id]) {
+    delete nextHeld[track.id];
+    if (writeStorage(storageKeys.held, nextHeld)) state.held = nextHeld;
+  }
+  updateCounts();
+}
+
+function holdSkippedTrack(track, progressSeconds) {
+  if (!track?.id) return;
+  const previous = state.held[track.id];
+  const skipCount = (previous?.skipCount || 0) + 1;
+  const holdDays = Math.min(30, 3 * (2 ** (skipCount - 1)));
+  const heldUntil = new Date(Date.now() + holdDays * 24 * 60 * 60 * 1000).toISOString();
+  const heard = progressSeconds / track.duration >= 0.6;
+  if (heard) markTrackHeard(track);
+  const nextHeld = {
+    ...state.held,
+    [track.id]: {
+      track,
+      skipCount,
+      heldUntil,
+      heard,
+      earlySkip: progressSeconds / track.duration < 0.3,
+      blocked: false,
+      lastSkippedAt: new Date().toISOString()
+    }
+  };
+  if (!writeStorage(storageKeys.held, nextHeld)) return;
+  state.held = nextHeld;
+  updateCounts();
+  showToast(heard
+    ? `"${track.title}" was marked heard and held back for ${holdDays} days.`
+    : nextHeld[track.id].earlySkip
+      ? `"${track.title}" was skipped early and held back for ${holdDays} days.`
+      : `"${track.title}" was held back for ${holdDays} days after the skip.`);
+}
+
+function releaseHeldTrack(trackId, blocked = false) {
+  const entry = state.held[trackId];
+  if (!entry) return;
+  const nextHeld = {
+    ...state.held,
+    [trackId]: { ...entry, blocked, heldUntil: blocked ? null : new Date().toISOString() }
+  };
+  if (!writeStorage(storageKeys.held, nextHeld)) return;
+  state.held = nextHeld;
+  updateCounts();
+  renderCollection();
+  showToast(blocked ? "Song blocked from future mixes." : "Song is eligible for rotation again.");
 }
 
 function formatTime(seconds) {
@@ -264,12 +351,16 @@ function updateSpotifyUi() {
     ? "Spotify connected"
     : state.spotifyConnecting ? "Connecting…"
       : state.spotifyError ? "Retry Spotify" : "Connect Spotify";
-  $("#save-button").querySelector("span").textContent = connected ? "Save to Spotify" : "Save mix";
-  $("#data-source-label").textContent = connected ? "SPOTIFY TRACKS · PLAYBACK IN SPOTIFY" : "SAMPLE TRACKS · PLAYBACK SIMULATED";
+  $("#save-button").querySelector("span").textContent = state.currentSavedMixId
+    ? state.spotifyPlaylist && connected ? "Update Spotify" : "Update saved mix"
+    : connected ? "Export to Spotify" : "Save mix";
+  $("#save-local-button").classList.toggle("hidden", !connected);
+  $("#save-local-button").textContent = state.currentSavedMixId ? "Update in Side B" : "Save in Side B";
+  $("#data-source-label").textContent = connected ? "SPOTIFY TRACKS · SPOTIFY DEVICE PLAYBACK" : "SAMPLE TRACKS · PLAYBACK SIMULATED";
   $("#profile-button").querySelector(".profile-copy strong").textContent = state.spotifyUser?.display_name || "Music explorer";
   $("#profile-button").querySelector(".profile-copy small").textContent = connected ? "Spotify account" : "Connect Spotify";
   $("#profile-button .avatar").textContent = (state.spotifyUser?.display_name || "D").trim().charAt(0).toUpperCase();
-  $("#playback-status-label").textContent = connected ? "OPEN IN SPOTIFY" : "DEMO PLAYBACK";
+  $("#playback-status-label").textContent = state.remotePlayback ? "SPOTIFY PLAYBACK" : connected ? "SPOTIFY DEVICE" : "DEMO PLAYBACK";
   $("#page-label").dataset.connected = String(connected);
 }
 
@@ -277,7 +368,7 @@ function openSpotifyDialog() {
   $("#client-id-input").value = spotifyClientId();
   $("#redirect-uri").textContent = redirectUri();
   $("#dialog-description").textContent = state.spotifyUser
-    ? `Connected as ${state.spotifyUser.display_name || state.spotifyUser.id}. Update your Client ID or disconnect this browser tab.`
+    ? `Connected as ${state.spotifyUser.display_name || state.spotifyUser.id}. Reconnect to approve playback and playlist permissions, or disconnect this browser tab.`
     : "Create a Spotify developer app, then paste its Client ID here. Sign-in uses Spotify's PKCE flow; this app never asks for your Spotify password or a client secret.";
   $("#dialog-done").textContent = state.spotifyUser ? "Disconnect" : "Save Client ID";
   $("#dialog-connect").textContent = state.spotifyUser ? "Reconnect" : "Save & connect";
@@ -344,6 +435,12 @@ async function loadSpotifyMix() {
   const queries = genres.length
     ? genres.map((genre) => `genre:"${genre}"`)
     : artistResult.items.slice(0, 4).map((artist) => `artist:"${artist.name}"`);
+  for (const seed of state.seedTracks) {
+    const seedArtist = seed.artist.split(",")[0].trim();
+    if (seedArtist && !queries.some((query) => query.toLowerCase().includes(seedArtist.toLowerCase()))) {
+      queries.unshift(`artist:"${seedArtist}"`);
+    }
+  }
   const searchResults = await Promise.all(queries.map(async (query) => {
     const params = new URLSearchParams({ q: query, type: "track", limit: "10" });
     if (state.spotifyUser.country) params.set("market", state.spotifyUser.country);
@@ -359,16 +456,39 @@ async function loadSpotifyMix() {
 }
 
 function composeMix(favorites, discoveries) {
+  const seedIds = new Set(state.seedTracks.map((track) => track.id));
+  const eligible = (track) => !isTrackUnavailable(track);
+  const availableSeeds = state.seedTracks.filter(eligible);
   const pools = {
-    familiar: shuffle(favorites),
-    discovery: shuffle(discoveries.filter((track) => !favorites.some((favorite) => favorite.id === track.id)))
+    familiar: shuffle(favorites.filter((track) => eligible(track) && !seedIds.has(track.id))),
+    discovery: shuffle(discoveries.filter((track) => eligible(track)
+      && !seedIds.has(track.id) && !favorites.some((favorite) => favorite.id === track.id)))
   };
+  const seedArtists = new Set(availableSeeds.map((track) => track.artist.toLowerCase()));
+  const favorSeedArtists = (pool) => pool.sort((first, second) => {
+    const firstMatch = [...seedArtists].some((artist) => artist && first.artist.toLowerCase().includes(artist));
+    const secondMatch = [...seedArtists].some((artist) => artist && second.artist.toLowerCase().includes(artist));
+    return Number(secondMatch) - Number(firstMatch);
+  });
+  if (state.seedMode === "guide") {
+    favorSeedArtists(pools.familiar);
+    favorSeedArtists(pools.discovery);
+  }
   const chosen = [];
   let totalSeconds = 0;
   let familiarCount = 0;
   const targetSeconds = state.durationMinutes * 60;
+  if (state.seedMode === "keep") {
+    availableSeeds.forEach((track) => {
+      const type = track.type || (track.familiarity > 0 ? "familiar" : "discovery");
+      chosen.push({ ...track, type });
+      if (type === "familiar") familiarCount += 1;
+      totalSeconds += track.duration;
+    });
+  }
 
-  while (totalSeconds < targetSeconds && (pools.familiar.length || pools.discovery.length)) {
+  while ((state.lengthMode === "duration" ? totalSeconds < targetSeconds : chosen.length < state.trackCountTarget)
+    && (pools.familiar.length || pools.discovery.length)) {
     const currentFamiliarShare = chosen.length ? familiarCount / chosen.length : 0;
     const preferredPool = currentFamiliarShare < state.ratio / 100 ? "familiar" : "discovery";
     const fallbackPool = preferredPool === "familiar" ? "discovery" : "familiar";
@@ -389,6 +509,7 @@ function composeMix(favorites, discoveries) {
   }));
   state.activeIndex = -1;
   state.spotifyPlaylist = null;
+  state.currentSavedMixId = null;
   stopPlayback();
   renderPlaylist();
   $("#mix-date").textContent = "Just now";
@@ -398,8 +519,33 @@ function composeMix(favorites, discoveries) {
 
 function updateDurationControl() {
   const range = $("#playlist-length");
-  $("#duration-value").textContent = `${state.durationMinutes} min`;
-  const percentage = ((state.durationMinutes - Number(range.min)) / (Number(range.max) - Number(range.min))) * 100;
+  const legend = $(".duration-legend");
+  if (state.lengthMode === "duration") {
+    range.min = "15";
+    range.max = "120";
+    range.step = "15";
+    range.value = String(state.durationMinutes);
+    range.setAttribute("aria-label", "Playlist length in minutes");
+    $("#duration-value").textContent = `${state.durationMinutes} min`;
+    legend.firstElementChild.textContent = "15 min";
+    legend.lastElementChild.textContent = "2 hours";
+  } else {
+    range.min = "5";
+    range.max = "40";
+    range.step = "1";
+    range.value = String(state.trackCountTarget);
+    range.setAttribute("aria-label", "Playlist length in songs");
+    $("#duration-value").textContent = `${state.trackCountTarget} songs`;
+    legend.firstElementChild.textContent = "5 songs";
+    legend.lastElementChild.textContent = "40 songs";
+  }
+  const percentage = ((Number(range.value) - Number(range.min)) / (Number(range.max) - Number(range.min))) * 100;
+  range.style.background = `linear-gradient(to right, var(--lime) 0 ${percentage}%, #3a3e35 ${percentage}% 100%)`;
+}
+
+function updateRatioControl() {
+  const range = $("#mix-ratio");
+  const percentage = ((state.ratio - Number(range.min)) / (Number(range.max) - Number(range.min))) * 100;
   range.style.background = `linear-gradient(to right, var(--lime) 0 ${percentage}%, #3a3e35 ${percentage}% 100%)`;
 }
 
@@ -410,7 +556,9 @@ async function buildMix() {
     const discoveries = tracks.filter((track) => track.familiarity === 0);
     composeMix(favorites, discoveries);
     const actualMinutes = state.playlist.reduce((sum, track) => sum + track.duration, 0) / 60;
-    showToast(actualMinutes < state.durationMinutes
+    showToast(state.lengthMode === "tracks"
+      ? `Sample mix ready with ${state.playlist.length} songs (~${Math.round(actualMinutes)} min).`
+      : actualMinutes < state.durationMinutes
       ? `Sample catalog has about ${Math.floor(actualMinutes)} minutes. Connect Spotify for a longer mix.`
       : `Sample mix ready, about ${Math.round(actualMinutes)} minutes long.`);
     return;
@@ -422,7 +570,9 @@ async function buildMix() {
     composeMix(data.familiarTracks, data.newTracks);
     if (!state.playlist.length) throw new Error("Spotify didn't return enough tracks for this listening window. Try a longer window.");
     const actualMinutes = state.playlist.reduce((sum, track) => sum + track.duration, 0) / 60;
-    showToast(actualMinutes < state.durationMinutes
+    showToast(state.lengthMode === "tracks"
+      ? `Your ${state.playlist.length}-song mix is ready (~${Math.round(actualMinutes)} min).`
+      : actualMinutes < state.durationMinutes
       ? `Spotify returned about ${Math.floor(actualMinutes)} minutes of unique tracks for this mix.`
       : `Your ~${state.durationMinutes}-minute mix is ready.`);
   } catch (error) {
@@ -438,16 +588,22 @@ function renderPlaylist() {
   trackList.replaceChildren(...state.playlist.map((track, index) => createTrackRow(track, index, false)));
   const totalSeconds = state.playlist.reduce((sum, track) => sum + track.duration, 0);
   $("#track-count").textContent = `${state.playlist.length} tracks`;
-  $("#mix-runtime").textContent = `${Math.round(totalSeconds / 60)} min · ${state.durationMinutes} min target`;
+  const targetLabel = state.lengthMode === "duration"
+    ? `${state.durationMinutes} min target`
+    : `${state.trackCountTarget} songs target`;
+  $("#mix-runtime").textContent = `${Math.round(totalSeconds / 60)} min · ${targetLabel}`;
   $("#save-button").classList.toggle("saved", Boolean(state.spotifyPlaylist));
-  $("#save-button").querySelector("span").textContent = state.spotifyPlaylist
-    ? "Saved to Spotify"
-    : state.spotifyUser ? "Save to Spotify" : "Save mix";
+  $("#save-button").querySelector("span").textContent = state.currentSavedMixId
+    ? state.spotifyPlaylist ? "Update Spotify" : "Update saved mix"
+    : state.spotifyUser ? "Export to Spotify" : "Save mix";
+  $("#save-local-button").classList.toggle("hidden", !state.spotifyUser);
+  $("#save-local-button").textContent = state.currentSavedMixId ? "Update in Side B" : "Save in Side B";
 }
 
-function createTrackRow(track, index, collection) {
+function createTrackRow(track, index, collection, collectionType = "") {
   const row = document.createElement("div");
   row.className = "track-row";
+  if (collectionType === "held") row.classList.add("held-track-row");
   if (!collection && index === state.activeIndex) row.classList.add("playing");
   const rank = document.createElement("span");
   rank.className = "track-index";
@@ -457,9 +613,7 @@ function createTrackRow(track, index, collection) {
   play.className = "row-play";
   play.setAttribute("aria-label", `Play ${track.title}`);
   play.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 12 7-12 7V5Z" fill="currentColor"/></svg>';
-  if (track.spotifyUrl) {
-    play.addEventListener("click", () => openSpotifyTrack(track));
-  } else if (!collection) {
+  if (!collection) {
     play.addEventListener("click", () => playTrack(index));
   }
 
@@ -481,12 +635,13 @@ function createTrackRow(track, index, collection) {
   main.append(cover, copy);
 
   const why = document.createElement("div");
-  why.className = `track-type ${track.type === "discovery" ? "discovery" : ""}`;
+  const isFamiliar = state.heard.includes(track.id) || track.type === "familiar" || track.familiarity > 0;
+  why.className = `track-type ${isFamiliar ? "" : "discovery"}`;
   const dot = document.createElement("span");
   dot.className = "type-dot";
   const chip = document.createElement("span");
   chip.className = "type-chip";
-  chip.textContent = track.type === "discovery" ? "New for you" : "In rotation";
+  chip.textContent = isFamiliar ? "In rotation" : "New for you";
   why.append(dot, chip);
 
   const time = document.createElement("div");
@@ -503,9 +658,512 @@ function createTrackRow(track, index, collection) {
   const duration = document.createElement("span");
   duration.textContent = formatTime(track.duration);
   time.append(like, duration);
+  if (!collection) {
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "track-remove";
+    remove.textContent = "×";
+    remove.setAttribute("aria-label", `Remove ${track.title} from this mix`);
+    remove.addEventListener("click", (event) => {
+      event.stopPropagation();
+      removeTrackFromMix(index);
+    });
+    time.append(remove);
+  } else if (collectionType === "held") {
+    const entry = state.held[track.id];
+    const actions = document.createElement("div");
+    actions.className = "held-actions";
+    const blockButton = document.createElement("button");
+    blockButton.type = "button";
+    blockButton.className = "text-button";
+    blockButton.textContent = entry.blocked ? "Allow again" : "Don't show again";
+    blockButton.addEventListener("click", () => releaseHeldTrack(track.id, !entry.blocked));
+    actions.append(blockButton);
+    if (!entry.blocked) {
+      const returnButton = document.createElement("button");
+      returnButton.type = "button";
+      returnButton.className = "text-button";
+      returnButton.textContent = "Return to rotation";
+      returnButton.addEventListener("click", () => releaseHeldTrack(track.id, false));
+      actions.append(returnButton);
+    }
+    time.append(actions);
+    const whyText = document.createElement("span");
+    whyText.className = "hold-reason";
+    whyText.textContent = entry.blocked
+      ? "Blocked until you allow it"
+      : `${entry.heard ? "Heard · cooldown" : entry.earlySkip ? "Early skip" : "Skipped"} · eligible ${new Date(entry.heldUntil).toLocaleDateString()}`;
+    why.append(whyText);
+  }
   row.append(rank, play, main, why, time);
   if (!collection) row.addEventListener("dblclick", () => playTrack(index));
   return row;
+}
+
+function removeTrackFromMix(index) {
+  const [removed] = state.playlist.splice(index, 1);
+  if (!removed) return;
+  if (state.activeIndex === index) {
+    stopPlayback();
+    state.activeIndex = -1;
+  } else if (state.activeIndex > index) {
+    state.activeIndex -= 1;
+  }
+  renderPlaylist();
+  persistEditedSavedMix();
+  showToast(`Removed "${removed.title}" from this mix.`);
+}
+
+function persistEditedSavedMix() {
+  if (!state.currentSavedMixId) return;
+  const index = state.saved.findIndex((mix) => mix.id === state.currentSavedMixId);
+  if (index < 0) return;
+  const nextSaved = [...state.saved];
+  nextSaved[index] = { ...nextSaved[index], tracks: state.playlist, title: $("#playlist-title").textContent };
+  if (writeStorage(storageKeys.saved, nextSaved)) state.saved = nextSaved;
+}
+
+function rememberSeed(track) {
+  if (state.held[track.id]?.blocked) {
+    showToast(`"${track.title}" is blocked. Allow it from Held back before using it as a seed.`);
+    return;
+  }
+  if (state.seedTracks.some((seed) => seed.id === track.id)) {
+    showToast(`"${track.title}" is already a seed song.`);
+    return;
+  }
+  const nextSeeds = [...state.seedTracks, track];
+  if (!writeStorage(storageKeys.seeds, nextSeeds)) return;
+  state.seedTracks = nextSeeds;
+  showToast(`"${track.title}" will guide your next mix.`);
+}
+
+function addTrackToMix(track) {
+  if (state.held[track.id]?.blocked) {
+    showToast(`"${track.title}" is blocked. Allow it from Held back before adding it.`);
+    return;
+  }
+  if (state.playlist.some((existing) => existing.id === track.id)) {
+    showToast(`"${track.title}" is already in this mix.`);
+    return;
+  }
+  state.playlist = [...state.playlist, track];
+  renderPlaylist();
+  persistEditedSavedMix();
+  showToast(`Added "${track.title}" to this mix.`);
+}
+
+function renderSearchResults(results) {
+  const list = $("#search-result-list");
+  list.replaceChildren();
+  if (!results.length) {
+    const empty = document.createElement("p");
+    empty.className = "search-empty";
+    empty.textContent = "No matching songs found.";
+    list.append(empty);
+    return;
+  }
+  results.forEach((track) => {
+    const row = document.createElement("div");
+    row.className = "search-result";
+    const copy = document.createElement("span");
+    copy.className = "saved-mix-copy";
+    const title = document.createElement("strong");
+    title.textContent = track.title;
+    const artist = document.createElement("small");
+    artist.textContent = `${track.artist} · ${formatTime(track.duration)}`;
+    copy.append(title, artist);
+    const actions = document.createElement("span");
+    actions.className = "search-result-actions";
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "text-button";
+    add.textContent = "Add to mix";
+    add.addEventListener("click", () => addTrackToMix(track));
+    const seed = document.createElement("button");
+    seed.type = "button";
+    seed.className = "text-button";
+    const alreadySeeded = state.seedTracks.some((candidate) => candidate.id === track.id);
+    seed.textContent = alreadySeeded ? "Remove seed" : "Use as seed";
+    seed.addEventListener("click", () => {
+      if (alreadySeeded) {
+        const nextSeeds = state.seedTracks.filter((candidate) => candidate.id !== track.id);
+        if (writeStorage(storageKeys.seeds, nextSeeds)) {
+          state.seedTracks = nextSeeds;
+          showToast(`"${track.title}" removed from your seed songs.`);
+          void searchSongs($("#track-search-input").value);
+        }
+      } else {
+        rememberSeed(track);
+        void searchSongs($("#track-search-input").value);
+      }
+    });
+    actions.append(add, seed);
+    row.append(copy, actions);
+    list.append(row);
+  });
+}
+
+let searchTimeout;
+async function searchSongs(query) {
+  const list = $("#search-result-list");
+  list.replaceChildren();
+  const term = query.trim();
+  if (!term) return;
+  if (state.spotifyUser) {
+    const params = new URLSearchParams({ q: term, type: "track", limit: "15" });
+    if (state.spotifyUser.country) params.set("market", state.spotifyUser.country);
+    try {
+      const result = await spotifyRequest(`/search?${params.toString()}`);
+      renderSearchResults(result.tracks.items.filter((item) => !item.is_local).map((item, index) => fromSpotifyTrack(
+        item,
+        index,
+        state.heard.includes(item.id) ? "familiar" : "discovery"
+      )));
+    } catch (error) {
+      const message = document.createElement("p");
+      message.className = "search-empty";
+      message.textContent = `Spotify search failed: ${error.message}`;
+      list.replaceChildren(message);
+      console.error("Spotify song search failed.", error);
+    }
+    return;
+  }
+  const lowered = term.toLowerCase();
+  renderSearchResults(tracks.filter((track) => `${track.title} ${track.artist} ${track.album}`.toLowerCase().includes(lowered))
+    .map((track) => ({ ...track, type: track.familiarity ? "familiar" : "discovery" })));
+}
+
+function openTrackSearch() {
+  $("#track-search-input").value = "";
+  $("#search-result-list").replaceChildren();
+  $("#track-search-dialog").showModal();
+  $("#track-search-input").focus();
+}
+
+function exportPlaylistFile() {
+  if (!state.playlist.length) {
+    showToast("Add songs to the mix before exporting it.");
+    return;
+  }
+  const fileData = {
+    format: "sideb-playlist",
+    version: 1,
+    playlist: {
+      title: $("#playlist-title").textContent,
+      createdAt: new Date().toISOString(),
+      tracks: state.playlist.map(({ id, title, artist, album, duration, spotifyUri, spotifyUrl, type, color }) => ({
+        id, title, artist, album, duration, spotifyUri, spotifyUrl, type, color
+      }))
+    }
+  };
+  const blob = new Blob([JSON.stringify(fileData, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  const safeName = fileData.playlist.title.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "-").trim() || "Side B playlist";
+  link.href = url;
+  link.download = `${safeName}.json`;
+  link.click();
+  URL.revokeObjectURL(url);
+  showToast("Playlist exported as a Side B JSON file.");
+}
+
+function exportPlaylistCsv() {
+  if (!state.playlist.length) {
+    showToast("Add songs to the mix before exporting it.");
+    return;
+  }
+  const escapeCsv = (value) => `"${String(value ?? "").replace(/"/g, '""')}"`;
+  const rows = [
+    ["Title", "Artist", "Album", "Duration (seconds)", "Spotify URL"],
+    ...state.playlist.map((track) => [track.title, track.artist, track.album, track.duration, track.spotifyUrl || ""])
+  ];
+  const csv = rows.map((row) => row.map(escapeCsv).join(",")).join("\r\n");
+  const blob = new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${$("#playlist-title").textContent.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "-") || "Side B playlist"}.csv`;
+  link.click();
+  URL.revokeObjectURL(url);
+  showToast("Playlist exported as a CSV track list.");
+}
+
+async function savePlaylistName() {
+  const name = $("#playlist-name-input").value.trim();
+  if (!name) {
+    showToast("Enter a name for this playlist.");
+    $("#playlist-name-input").focus();
+    return;
+  }
+  $("#playlist-title").textContent = name;
+  persistEditedSavedMix();
+  if (state.spotifyPlaylist && state.spotifyUser) {
+    try {
+      await spotifyRequest(`/playlists/${encodeURIComponent(state.spotifyPlaylist.id)}`, {
+        method: "PUT",
+        body: JSON.stringify({ name, public: false })
+      });
+    } catch (error) {
+      showToast(`Renamed in Side B, but Spotify could not update it: ${error.message}`);
+      console.error("Spotify playlist rename failed.", error);
+      $("#playlist-name-dialog").close();
+      return;
+    }
+  }
+  $("#playlist-name-dialog").close();
+  renderPlaylist();
+  showToast("Playlist renamed.");
+}
+
+function normalizeImportedTrack(track, index) {
+  if (!track || typeof track.title !== "string" || typeof track.artist !== "string"
+    || !Number.isFinite(track.duration) || track.duration <= 0 || track.duration > 3600) return null;
+  return {
+    id: typeof track.id === "string" && track.id ? track.id : `imported-${index}-${crypto.randomUUID?.() || Date.now()}`,
+    title: track.title,
+    artist: track.artist,
+    album: typeof track.album === "string" ? track.album : "Unknown album",
+    duration: Math.round(track.duration),
+    spotifyUri: typeof track.spotifyUri === "string" ? track.spotifyUri : undefined,
+    spotifyUrl: typeof track.spotifyUrl === "string" ? track.spotifyUrl : undefined,
+    color: typeof track.color === "string" ? track.color : getTrackColor(index),
+    type: track.type === "familiar" ? "familiar" : "discovery",
+    familiarity: track.type === "familiar" ? 60 : 0
+  };
+}
+
+function loadImportedPlaylist(title, rawTracks) {
+  if (!Array.isArray(rawTracks) || !rawTracks.length || rawTracks.length > 500) {
+    throw new Error("The file must contain between 1 and 500 playlist tracks.");
+  }
+  const importedTracks = rawTracks.map(normalizeImportedTrack);
+  const invalidCount = importedTracks.filter((track) => !track).length;
+  state.playlist = importedTracks.filter(Boolean);
+  if (!state.playlist.length) throw new Error("No valid tracks were found in that playlist.");
+  state.currentSavedMixId = null;
+  state.spotifyPlaylist = null;
+  state.activeIndex = -1;
+  stopPlayback();
+  renderPlaylist();
+  $("#playlist-title").textContent = title || "Imported playlist";
+  setView("mix");
+  showToast(invalidCount
+    ? `Imported ${state.playlist.length} songs; skipped ${invalidCount} invalid entries.`
+    : `Imported ${state.playlist.length} songs.`);
+}
+
+function showUnmatchedSongs(songs) {
+  if (!songs.length) return;
+  const list = $("#unmatched-list");
+  list.replaceChildren();
+  songs.forEach((song) => {
+    const item = document.createElement("li");
+    item.textContent = song;
+    list.append(item);
+  });
+  $("#unmatched-summary").textContent = `${songs.length} ${songs.length === 1 ? "song was" : "songs were"} left out of the imported playlist.`;
+  $("#unmatched-dialog").showModal();
+}
+
+async function findSpotifyTrack(track) {
+  const query = new URLSearchParams({
+    q: `track:"${track.title.replace(/"/g, "")}" artist:"${track.artist.replace(/"/g, "")}"`,
+    type: "track",
+    limit: "5"
+  });
+  const results = await spotifyRequest(`/search?${query.toString()}`);
+  const artists = track.artist.split(/[,;&]/).map((artist) => artist.trim().toLowerCase()).filter(Boolean);
+  return results.tracks.items.find((candidate) =>
+    candidate.name.trim().toLowerCase() === track.title.trim().toLowerCase()
+    && candidate.artists.some((artist) => artists.includes(artist.name.toLowerCase()))) || null;
+}
+
+async function matchPlaylistTracksToSpotify() {
+  const unmatched = [];
+  const tracks = [];
+  for (const [index, track] of state.playlist.entries()) {
+    if (track.spotifyUri?.startsWith("spotify:track:")) {
+      tracks.push(track);
+      continue;
+    }
+    const match = await findSpotifyTrack(track);
+    if (match) {
+      tracks.push({
+        ...track,
+        ...fromSpotifyTrack(match, index, track.type === "familiar" ? "familiar" : "discovery")
+      });
+    } else {
+      tracks.push(track);
+      unmatched.push(`${track.title} — ${track.artist}`);
+    }
+  }
+  state.playlist = tracks;
+  renderPlaylist();
+  return unmatched;
+}
+
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let field = "";
+  let quoted = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index];
+    if (character === '"' && quoted && text[index + 1] === '"') {
+      field += '"';
+      index += 1;
+    } else if (character === '"') {
+      quoted = !quoted;
+    } else if (character === "," && !quoted) {
+      row.push(field);
+      field = "";
+    } else if ((character === "\n" || character === "\r") && !quoted) {
+      if (character === "\r" && text[index + 1] === "\n") index += 1;
+      row.push(field);
+      if (row.some((value) => value.trim())) rows.push(row);
+      row = [];
+      field = "";
+    } else {
+      field += character;
+    }
+  }
+  if (quoted) throw new Error("The CSV has an unclosed quoted field.");
+  row.push(field);
+  if (row.some((value) => value.trim())) rows.push(row);
+  if (rows.length < 2) throw new Error("The CSV needs a header row and at least one song.");
+  const headers = rows[0].map((value) => value.replace(/^\uFEFF/, "").trim().toLowerCase());
+  const indexOf = (...names) => headers.findIndex((header) => names.includes(header));
+  const titleIndex = indexOf("title", "name", "track name", "song");
+  const artistIndex = indexOf("artist", "artist name", "artists");
+  const albumIndex = indexOf("album", "album name");
+  const durationIndex = indexOf("duration (seconds)", "duration seconds", "duration", "duration (ms)", "duration_ms");
+  if (titleIndex < 0 || artistIndex < 0) throw new Error("The CSV must include Title/Track Name and Artist columns.");
+  return rows.slice(1).slice(0, 500).map((values, index) => {
+    const rawDuration = values[durationIndex]?.trim() || "";
+    const durationValue = rawDuration.includes(":")
+      ? rawDuration.split(":").reduce((seconds, part) => seconds * 60 + Number(part), 0)
+      : Number(rawDuration);
+    const durationSeconds = headers[durationIndex]?.includes("ms") || durationValue > 10_000
+      ? durationValue / 1000
+      : durationValue;
+    return {
+      id: `csv-${index}-${crypto.randomUUID?.() || Date.now()}`,
+      title: values[titleIndex]?.trim(),
+      artist: values[artistIndex]?.trim(),
+      album: albumIndex >= 0 ? values[albumIndex]?.trim() : "Unknown album",
+      duration: Number.isFinite(durationSeconds) && durationSeconds > 0 ? durationSeconds : 210,
+      color: getTrackColor(index),
+      type: "discovery",
+      familiarity: 0
+    };
+  }).filter((track) => track.title && track.artist);
+}
+
+async function importCsvPlaylist(title, csvText) {
+  const parsedTracks = parseCsv(csvText);
+  if (!parsedTracks.length) throw new Error("No song rows were found in this CSV.");
+  if (!state.spotifyUser) {
+    loadImportedPlaylist(title, parsedTracks);
+    showToast("CSV imported. Connect Spotify and search for matched tracks to enable full playback or Spotify saving.");
+    return;
+  }
+  const matched = [];
+  const unmatched = [];
+  for (const track of parsedTracks) {
+    const match = await findSpotifyTrack(track);
+    if (match) {
+      matched.push(fromSpotifyTrack(match, matched.length, state.heard.includes(match.id) ? "familiar" : "discovery"));
+    } else {
+      unmatched.push(`${track.title} — ${track.artist}`);
+    }
+  }
+  if (!matched.length) {
+    $("#playlist-import-dialog").close();
+    showUnmatchedSongs(unmatched);
+    throw new Error("No CSV songs matched Spotify tracks. Review the unmatched list and check the title and artist columns.");
+  }
+  loadImportedPlaylist(title, matched);
+  $("#playlist-import-dialog").close();
+  if (unmatched.length) showUnmatchedSongs(unmatched);
+}
+
+async function importSpotifyPlaylist(playlist) {
+  const tracksFromSpotify = [];
+  const unmatched = [];
+  let offset = 0;
+  let total = Infinity;
+  while (offset < total && offset < 500) {
+    const result = await spotifyRequest(`/playlists/${encodeURIComponent(playlist.id)}/items?limit=100&offset=${offset}`);
+    total = result.total || 0;
+    for (const item of result.items || []) {
+      const spotifyTrack = item.item || item.track;
+      if (spotifyTrack?.type === "track" && Array.isArray(spotifyTrack.artists)
+        && !item.is_local && !spotifyTrack.is_local) {
+        tracksFromSpotify.push(fromSpotifyTrack(spotifyTrack, tracksFromSpotify.length, "discovery"));
+      } else {
+        unmatched.push(spotifyTrack?.name
+          ? `${spotifyTrack.name} — ${spotifyTrack.artists?.map((artist) => artist.name).join(", ") || "Unavailable or non-track item"}`
+          : "Unavailable Spotify track");
+      }
+    }
+    if (!result.next || !result.items?.length) break;
+    offset += result.items.length;
+  }
+  if (!tracksFromSpotify.length) {
+    $("#playlist-import-dialog").close();
+    showUnmatchedSongs(unmatched);
+    throw new Error("This Spotify playlist has no transferable tracks.");
+  }
+  loadImportedPlaylist(playlist.name, tracksFromSpotify);
+  $("#playlist-import-dialog").close();
+  if (total > offset) unmatched.push(`${total - offset} additional playlist tracks were not fetched (import limit: 500).`);
+  showUnmatchedSongs(unmatched);
+}
+
+async function loadSpotifyPlaylists() {
+  const list = $("#spotify-playlist-list");
+  list.replaceChildren();
+  if (!state.spotifyUser) {
+    const message = document.createElement("p");
+    message.className = "search-empty";
+    message.textContent = "Connect Spotify first to import one of its playlists.";
+    list.append(message);
+    return;
+  }
+  try {
+    for (let offset = 0; offset < 200; offset += 50) {
+      const result = await spotifyRequest(`/me/playlists?limit=50&offset=${offset}`);
+      (result.items || []).forEach((playlist) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "saved-mix-card";
+        const copy = document.createElement("span");
+        copy.className = "saved-mix-copy";
+        const name = document.createElement("strong");
+        name.textContent = playlist.name;
+        const meta = document.createElement("small");
+        const trackCount = playlist.items?.total ?? playlist.tracks?.total ?? 0;
+        meta.textContent = `${trackCount} ${trackCount === 1 ? "track" : "tracks"}${playlist.owner?.display_name ? ` · ${playlist.owner.display_name}` : ""}`;
+        copy.append(name, meta);
+        button.append(copy);
+        button.addEventListener("click", () => {
+          void importSpotifyPlaylist(playlist).catch((error) => {
+            showToast(`Couldn't import Spotify playlist: ${error.message}`);
+            console.error("Spotify playlist import failed.", error);
+          });
+        });
+        list.append(button);
+      });
+      if (!result.next || !result.items?.length) break;
+    }
+  } catch (error) {
+    const message = document.createElement("p");
+    message.className = "search-empty";
+    message.textContent = `Could not load Spotify playlists: ${error.message}`;
+    list.replaceChildren(message);
+    console.error("Spotify playlists could not be loaded.", error);
+  }
 }
 
 function toggleLike(track) {
@@ -532,8 +1190,10 @@ function playTrack(index) {
   $("#progress-fill").style.width = "0%";
   if (track.spotifyUri) {
     renderPlaylist();
-    showToast("Opening this track in Spotify. Playback progress is not shared with Side B.");
-    if (track.spotifyUrl) window.open(track.spotifyUrl, "_blank", "noopener,noreferrer");
+    void startSpotifyPlayback(index).catch((error) => {
+      showToast(`Couldn't start Spotify playback: ${error.message}`);
+      console.error("Spotify playback could not start.", error);
+    });
     return;
   }
   $("#player-play-button").setAttribute("aria-label", "Pause");
@@ -543,18 +1203,19 @@ function playTrack(index) {
   state.timer = window.setInterval(advancePlayback, 1000);
 }
 
-function openSpotifyTrack(track) {
-  if (track.spotifyUrl) window.open(track.spotifyUrl, "_blank", "noopener,noreferrer");
-}
-
 function advancePlayback() {
   if (state.activeIndex < 0) return;
   const track = state.playlist[state.activeIndex];
   state.elapsed += 1;
   $("#current-time").textContent = formatTime(state.elapsed);
   $("#progress-fill").style.width = `${Math.min(state.elapsed / track.duration * 100, 100)}%`;
-  if (state.elapsed / track.duration >= 0.6) saveDiscovery(track);
-  if (state.elapsed >= track.duration) nextTrack();
+  if (state.elapsed / track.duration >= 0.6) {
+    markTrackHeard(track);
+    if (track.type === "discovery") saveDiscovery(track);
+  }
+  if (state.elapsed >= track.duration) {
+    playTrack((state.activeIndex + 1) % state.playlist.length);
+  }
 }
 
 function saveDiscovery(track) {
@@ -578,10 +1239,75 @@ function saveDiscovery(track) {
 
 function stopPlayback() {
   if (state.timer) window.clearInterval(state.timer);
+  if (state.remoteTimer) window.clearInterval(state.remoteTimer);
   state.timer = null;
+  state.remoteTimer = null;
+  state.remotePlayback = false;
+  state.lastRemoteTrackId = null;
   $("#player-bar").classList.remove("is-playing");
   $("#player-play-button").setAttribute("aria-label", "Play");
   $("#player-play-button").innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 12 7-12 7V5Z" fill="currentColor"/></svg>';
+}
+
+async function startSpotifyPlayback(index) {
+  if (!state.spotifyUser) throw new Error("Connect Spotify before starting full-track playback.");
+  const uris = state.playlist.map((track) => track.spotifyUri);
+  if (!uris.length || uris.some((uri) => !uri)) {
+    throw new Error("Every song in this mix needs a Spotify match for full-track playback.");
+  }
+  if (state.remoteTimer) window.clearInterval(state.remoteTimer);
+  state.remoteTimer = null;
+  await spotifyRequest("/me/player/play", {
+    method: "PUT",
+    body: JSON.stringify({ uris, offset: { position: index } })
+  });
+  state.activeIndex = index;
+  state.elapsed = 0;
+  state.remotePlayback = true;
+  state.lastRemoteTrackId = state.playlist[index].id;
+  $("#player-bar").classList.add("is-playing");
+  $("#player-play-button").setAttribute("aria-label", "Pause");
+  $("#player-play-button").innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5h4v14H7zm7 0h4v14h-4z" fill="currentColor"/></svg>';
+  updateSpotifyUi();
+  renderPlaylist();
+  await pollSpotifyPlayback();
+  state.remoteTimer = window.setInterval(() => {
+    void pollSpotifyPlayback().catch((error) => {
+      if (state.remoteTimer) window.clearInterval(state.remoteTimer);
+      state.remoteTimer = null;
+      state.remotePlayback = false;
+      stopPlayback();
+      showToast(`Spotify playback tracking stopped: ${error.message}`);
+      console.error("Spotify playback status polling failed.", error);
+    });
+  }, 3000);
+}
+
+async function pollSpotifyPlayback() {
+  const playback = await spotifyRequest("/me/player");
+  if (!playback?.item) return;
+  const track = state.playlist.find((candidate) => candidate.spotifyUri === playback.item.uri);
+  if (!track) return;
+  state.activeIndex = state.playlist.indexOf(track);
+  state.lastRemoteTrackId = track.id;
+  state.elapsed = Math.floor((playback.progress_ms || 0) / 1000);
+  $("#player-track").textContent = track.title;
+  $("#player-artist").textContent = track.artist;
+  $("#player-cover").style.background = track.color;
+  $("#duration-time").textContent = formatTime(track.duration);
+  $("#current-time").textContent = formatTime(state.elapsed);
+  $("#progress-fill").style.width = `${Math.min(state.elapsed / track.duration * 100, 100)}%`;
+  $("#player-bar").classList.toggle("is-playing", Boolean(playback.is_playing));
+  $("#player-play-button").setAttribute("aria-label", playback.is_playing ? "Pause" : "Play");
+  $("#player-play-button").innerHTML = playback.is_playing
+    ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5h4v14H7zm7 0h4v14h-4z" fill="currentColor"/></svg>'
+    : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 12 7-12 7V5Z" fill="currentColor"/></svg>';
+  if (state.elapsed / track.duration >= 0.6) {
+    markTrackHeard(track);
+    if (track.type === "discovery") saveDiscovery(track);
+  }
+  updateSpotifyUi();
+  renderPlaylist();
 }
 
 function togglePlayback() {
@@ -591,8 +1317,16 @@ function togglePlayback() {
   }
   const activeTrack = state.playlist[state.activeIndex];
   if (activeTrack?.spotifyUri) {
-    openSpotifyTrack(activeTrack);
-    showToast("Playback is handled by Spotify.");
+    const action = state.remotePlayback
+      ? $("#player-play-button").getAttribute("aria-label") === "Pause" ? "pause" : "play"
+      : null;
+    const control = action
+      ? spotifyRequest(`/me/player/${action}`, { method: "PUT" })
+      : startSpotifyPlayback(state.activeIndex);
+    void control.then(() => state.remotePlayback ? pollSpotifyPlayback() : undefined).catch((error) => {
+      showToast(`Spotify playback control failed: ${error.message}`);
+      console.error("Spotify playback control failed.", error);
+    });
     return;
   }
   if (state.timer) {
@@ -611,26 +1345,138 @@ function togglePlayback() {
 
 function nextTrack() {
   if (state.playlist.length === 0) return;
+  if (state.remotePlayback && state.playlist[state.activeIndex]?.spotifyUri) {
+    holdSkippedTrack(state.playlist[state.activeIndex], state.elapsed);
+    const nextIndex = (state.activeIndex + 1) % state.playlist.length;
+    void startSpotifyPlayback(nextIndex).catch((error) => {
+      showToast(`Couldn't skip in Spotify: ${error.message}`);
+      console.error("Spotify track skip failed.", error);
+    });
+    return;
+  }
+  if (state.timer && state.activeIndex >= 0) {
+    holdSkippedTrack(state.playlist[state.activeIndex], state.elapsed);
+  }
   playTrack((state.activeIndex + 1) % state.playlist.length);
 }
 
 function previousTrack() {
   if (state.elapsed > 3) {
+    if (state.remotePlayback) {
+      void spotifyRequest("/me/player/seek?position_ms=0", { method: "PUT" }).catch((error) => {
+        showToast(`Couldn't restart this Spotify track: ${error.message}`);
+        console.error("Spotify seek failed.", error);
+      });
+    }
     state.elapsed = 0;
     $("#progress-fill").style.width = "0%";
     $("#current-time").textContent = "0:00";
   } else if (state.playlist.length) {
+    if (state.remotePlayback && state.activeIndex >= 0) {
+      const previousIndex = (state.activeIndex - 1 + state.playlist.length) % state.playlist.length;
+      void startSpotifyPlayback(previousIndex).catch((error) => {
+        showToast(`Couldn't play the previous Spotify track: ${error.message}`);
+        console.error("Spotify previous-track control failed.", error);
+      });
+      return;
+    }
     playTrack((state.activeIndex - 1 + state.playlist.length) % state.playlist.length);
   }
 }
 
+function saveMixLocally() {
+  if (!state.playlist.length) return;
+  const existingIndex = state.saved.findIndex((mix) => mix.id === state.currentSavedMixId);
+  const existing = existingIndex >= 0 ? state.saved[existingIndex] : null;
+  const snapshot = {
+    id: existing?.id || (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())),
+    title: $("#playlist-title").textContent,
+    period: state.period,
+    durationMinutes: state.durationMinutes,
+    lengthMode: state.lengthMode,
+    trackCountTarget: state.trackCountTarget,
+    createdAt: existing?.createdAt || new Date().toISOString(),
+    tracks: state.playlist,
+    spotifyPlaylist: state.spotifyPlaylist || existing?.spotifyPlaylist
+  };
+  const nextSaved = [...state.saved];
+  if (existingIndex >= 0) nextSaved[existingIndex] = snapshot;
+  else nextSaved.unshift(snapshot);
+  if (!writeStorage(storageKeys.saved, nextSaved)) return;
+  state.saved = nextSaved;
+  state.currentSavedMixId = snapshot.id;
+  renderPlaylist();
+  showToast(existing ? "Saved mix updated in Side B." : "Mix saved in Side B.");
+}
+
 async function saveMix() {
   if (!state.playlist.length) return;
+  if (state.currentSavedMixId && state.spotifyPlaylist && state.spotifyUser) {
+    const button = $("#save-button");
+    button.disabled = true;
+    button.querySelector("span").textContent = "Matching Spotify tracks…";
+    try {
+      const unmatched = await matchPlaylistTracksToSpotify();
+      const uris = state.playlist.map((track) => track.spotifyUri).filter(Boolean);
+      if (!uris.length) {
+        showUnmatchedSongs(unmatched);
+        throw new Error("No playlist tracks could be matched to Spotify, so the Spotify playlist was not changed.");
+      }
+      button.querySelector("span").textContent = "Updating Spotify…";
+      await spotifyRequest(`/playlists/${encodeURIComponent(state.spotifyPlaylist.id)}`, {
+        method: "PUT",
+        body: JSON.stringify({ name: $("#playlist-title").textContent, public: false })
+      });
+      await spotifyRequest(`/playlists/${encodeURIComponent(state.spotifyPlaylist.id)}/items`, {
+        method: "PUT",
+        body: JSON.stringify({ uris })
+      });
+      const index = state.saved.findIndex((mix) => mix.id === state.currentSavedMixId);
+      if (index >= 0) {
+        const nextSaved = [...state.saved];
+        nextSaved[index] = { ...nextSaved[index], title: $("#playlist-title").textContent, tracks: state.playlist };
+        if (!writeStorage(storageKeys.saved, nextSaved)) throw new Error("Spotify was updated, but Side B could not update its saved copy.");
+        state.saved = nextSaved;
+      }
+      if (unmatched.length) {
+        showToast(`Spotify playlist updated. ${unmatched.length} unmatched ${unmatched.length === 1 ? "song was" : "songs were"} left out.`);
+        showUnmatchedSongs(unmatched);
+      } else {
+        showToast("Saved playlist updated in Spotify and Side B.");
+      }
+    } catch (error) {
+      showToast(`Couldn't update the Spotify playlist: ${error.message}`);
+      console.error("Spotify playlist update failed.", error);
+    } finally {
+      button.disabled = false;
+      renderPlaylist();
+    }
+    return;
+  }
+  if (state.currentSavedMixId && !state.spotifyUser) {
+    const index = state.saved.findIndex((mix) => mix.id === state.currentSavedMixId);
+    if (index >= 0) {
+      const nextSaved = [...state.saved];
+      nextSaved[index] = { ...nextSaved[index], title: $("#playlist-title").textContent, tracks: state.playlist };
+      if (!writeStorage(storageKeys.saved, nextSaved)) return;
+      state.saved = nextSaved;
+      showToast("Saved playlist updated.");
+      renderPlaylist();
+      return;
+    }
+  }
   if (state.spotifyUser) {
     const button = $("#save-button");
     button.disabled = true;
-    button.querySelector("span").textContent = "Saving to Spotify…";
+    button.querySelector("span").textContent = "Matching Spotify tracks…";
     try {
+      const unmatched = await matchPlaylistTracksToSpotify();
+      const uris = state.playlist.map((track) => track.spotifyUri).filter(Boolean);
+      if (!uris.length) {
+        showUnmatchedSongs(unmatched);
+        throw new Error("No playlist tracks could be matched to Spotify, so no Spotify playlist was created.");
+      }
+      button.querySelector("span").textContent = "Exporting to Spotify…";
       const playlist = await spotifyRequest("/me/playlists", {
         method: "POST",
         body: JSON.stringify({
@@ -640,8 +1486,6 @@ async function saveMix() {
           collaborative: false
         })
       });
-      const uris = state.playlist.map((track) => track.spotifyUri).filter(Boolean);
-      if (!uris.length) throw new Error("This mix has no Spotify tracks to add.");
       await spotifyRequest(`/playlists/${encodeURIComponent(playlist.id)}/items`, {
         method: "POST",
         body: JSON.stringify({ uris })
@@ -656,20 +1500,30 @@ async function saveMix() {
         title: $("#playlist-title").textContent,
         period: state.period,
         durationMinutes: state.durationMinutes,
+        lengthMode: state.lengthMode,
+        trackCountTarget: state.trackCountTarget,
         createdAt: new Date().toISOString(),
         tracks: state.playlist,
         spotifyPlaylist: state.spotifyPlaylist
       };
       const nextSaved = [snapshot, ...state.saved];
       const savedLocally = writeStorage(storageKeys.saved, nextSaved);
-      if (savedLocally) state.saved = nextSaved;
+      if (savedLocally) {
+        state.saved = nextSaved;
+        state.currentSavedMixId = snapshot.id;
+      }
       $("#save-button").classList.add("saved");
-      button.querySelector("span").textContent = "Saved to Spotify";
-      showToast(savedLocally
-        ? "Playlist saved to Spotify and Side B. Find it in Spotify or Android Auto."
-        : "Playlist saved to Spotify, but Side B couldn't save its local shortcut.");
+      button.querySelector("span").textContent = "Exported to Spotify";
+      if (unmatched.length) {
+        showToast(`Spotify playlist created. ${unmatched.length} unmatched ${unmatched.length === 1 ? "song was" : "songs were"} left out.`);
+        showUnmatchedSongs(unmatched);
+      } else {
+        showToast(savedLocally
+          ? "Playlist exported to Spotify and saved in Side B. Find it in Spotify or Android Auto."
+          : "Playlist exported to Spotify, but Side B couldn't save its local shortcut.");
+      }
     } catch (error) {
-      button.querySelector("span").textContent = "Save to Spotify";
+      button.querySelector("span").textContent = "Export to Spotify";
       showToast(`Couldn't save the Spotify playlist: ${error.message}`);
       console.error("Spotify playlist creation failed.", error);
     } finally {
@@ -677,25 +1531,12 @@ async function saveMix() {
     }
     return;
   }
-  const snapshot = {
-    id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()),
-    title: $("#playlist-title").textContent,
-    period: state.period,
-    durationMinutes: state.durationMinutes,
-    createdAt: new Date().toISOString(),
-    tracks: state.playlist,
-    spotifyPlaylist: state.spotifyPlaylist
-  };
-  const nextSaved = [snapshot, ...state.saved];
-  if (!writeStorage(storageKeys.saved, nextSaved)) return;
-  state.saved = nextSaved;
-  $("#save-button").classList.add("saved");
-  $("#save-button").querySelector("span").textContent = "Saved";
-  showToast("Mix saved in this browser.");
+  saveMixLocally();
 }
 
 function updateCounts() {
   $("#discovery-count").textContent = state.discoveries.length;
+  $("#held-count").textContent = Object.keys(state.held).length;
 }
 
 function selectPeriod(period) {
@@ -715,18 +1556,33 @@ function setView(view) {
   document.querySelectorAll(".nav-item").forEach((item) => item.classList.toggle("active", item.dataset.view === view));
   $("#mix-view").classList.toggle("hidden", view !== "mix");
   $("#collection-view").classList.toggle("hidden", view === "mix");
-  $("#page-label").textContent = view === "mix" ? "YOUR MIX" : view === "discoveries" ? "DISCOVERED" : "SAVED MIXES";
-  $("#collection-title").textContent = view === "discoveries" ? "Your discoveries." : "Your saved mixes.";
+  $("#page-label").textContent = view === "mix" ? "YOUR MIX" : view === "discoveries" ? "DISCOVERED" : view === "held" ? "HELD BACK" : "SAVED MIXES";
+  $("#collection-title").textContent = view === "discoveries" ? "Your discoveries." : view === "held" ? "Held back songs." : "Your saved mixes.";
   $("#collection-description").textContent = view === "discoveries"
     ? "Songs you listened to at least 60% of the way through."
-    : "Mixes you've kept for another drive.";
+    : view === "held" ? "Songs temporarily held after a skip, or blocked until you allow them again."
+      : "Mixes you've kept for another drive.";
   renderCollection();
 }
 
 function renderCollection() {
   collectionList.replaceChildren();
   const isDiscovery = state.currentView === "discoveries";
+  const isHeld = state.currentView === "held";
   const collectionEmpty = $("#collection-empty");
+  if (isHeld) {
+    $("#empty-state-title").textContent = "Nothing is held back.";
+    $("#empty-state-copy").textContent = "Songs skipped before 60% will be saved here, where you can return them to rotation or block them.";
+    $("#collection-count").textContent = `${Object.keys(state.held).length} songs held or blocked`;
+    $("#clear-collection").textContent = "Clear hold list";
+    Object.values(state.held).forEach((entry, index) => {
+      collectionList.append(createTrackRow(entry.track, index, true, "held"));
+    });
+    collectionEmpty.classList.toggle("hidden", Object.keys(state.held).length > 0);
+    $("#clear-collection").classList.toggle("hidden", Object.keys(state.held).length === 0);
+    $("#back-to-mix").classList.remove("hidden");
+    return;
+  }
   if (isDiscovery) {
     $("#empty-state-title").textContent = "Every favorite starts somewhere.";
     $("#empty-state-copy").textContent = "Play a track from your mix. When you reach 60%, we'll save it here so you can come back to it.";
@@ -759,18 +1615,24 @@ function renderCollection() {
     const title = document.createElement("strong");
     title.textContent = mix.title;
     const meta = document.createElement("small");
-    const mixMinutes = mix.durationMinutes || Math.round(mix.tracks.reduce((sum, track) => sum + track.duration, 0) / 60);
-    meta.textContent = `${mix.tracks.length} tracks · ${mixMinutes} min · ${periodLabels[mix.period]} · ${new Date(mix.createdAt).toLocaleDateString()}`;
+    const actualMinutes = Math.round(mix.tracks.reduce((sum, track) => sum + track.duration, 0) / 60);
+    const targetLabel = mix.lengthMode === "tracks"
+      ? `${mix.trackCountTarget || mix.tracks.length} songs target`
+      : `${mix.durationMinutes || actualMinutes} min target`;
+    meta.textContent = `${mix.tracks.length} tracks · ${actualMinutes} min · ${targetLabel} · ${periodLabels[mix.period]} · ${new Date(mix.createdAt).toLocaleDateString()}`;
     copy.append(title, meta);
     card.append(cover, copy);
     card.addEventListener("click", () => {
       selectPeriod(mix.period);
+      state.lengthMode = mix.lengthMode || "duration";
+      $("#playlist-length-mode").value = state.lengthMode;
       state.durationMinutes = mix.durationMinutes || Math.round(mix.tracks.reduce((sum, track) => sum + track.duration, 0) / 60);
-      $("#playlist-length").value = String(Math.min(120, Math.max(15, Math.round(state.durationMinutes / 15) * 15)));
-      state.durationMinutes = Number($("#playlist-length").value);
+      state.durationMinutes = Math.min(120, Math.max(15, Math.round(state.durationMinutes / 15) * 15));
+      state.trackCountTarget = Math.min(40, Math.max(5, mix.trackCountTarget || mix.tracks.length));
       updateDurationControl();
       state.playlist = mix.tracks;
       state.spotifyPlaylist = mix.spotifyPlaylist || null;
+      state.currentSavedMixId = mix.id;
       state.activeIndex = -1;
       stopPlayback();
       renderPlaylist();
@@ -804,11 +1666,22 @@ document.querySelectorAll("[data-period]").forEach((button) => {
 $("#mix-ratio").addEventListener("input", (event) => {
   state.ratio = Number(event.target.value);
   $("#ratio-value").innerHTML = `${state.ratio}% <span>familiar</span>`;
-  event.target.style.background = `linear-gradient(to right, var(--lime) 0 ${state.ratio}%, #3a3e35 ${state.ratio}% 100%)`;
+  updateRatioControl();
 });
 $("#playlist-length").addEventListener("input", (event) => {
-  state.durationMinutes = Number(event.target.value);
+  if (state.lengthMode === "duration") {
+    state.durationMinutes = Number(event.target.value);
+  } else {
+    state.trackCountTarget = Number(event.target.value);
+  }
   updateDurationControl();
+});
+$("#playlist-length-mode").addEventListener("change", (event) => {
+  state.lengthMode = event.target.value;
+  updateDurationControl();
+});
+$("#seed-mode").addEventListener("change", (event) => {
+  state.seedMode = event.target.value;
 });
 $("#generate-button").addEventListener("click", buildMix);
 $("#shuffle-button").addEventListener("click", () => {
@@ -817,16 +1690,67 @@ $("#shuffle-button").addEventListener("click", () => {
   showToast("Mix shuffled.");
 });
 $("#save-button").addEventListener("click", saveMix);
-$("#play-all-button").addEventListener("click", () => {
-  if (state.spotifyUser) {
-    if (state.spotifyPlaylist?.url) {
-      window.open(state.spotifyPlaylist.url, "_blank", "noopener,noreferrer");
-    } else {
-      showToast("Save this mix to Spotify first, then open the playlist here or in Android Auto.");
-    }
+$("#save-local-button").addEventListener("click", saveMixLocally);
+$("#play-all-button").addEventListener("click", () => playTrack(0));
+$("#add-songs-button").addEventListener("click", openTrackSearch);
+$("#export-playlist-button").addEventListener("click", exportPlaylistFile);
+$("#export-csv-button").addEventListener("click", exportPlaylistCsv);
+$("#import-playlist-button").addEventListener("click", () => {
+  $("#spotify-playlist-list").replaceChildren();
+  $("#playlist-import-dialog").showModal();
+});
+$("#spotify-playlist-import").addEventListener("click", () => { void loadSpotifyPlaylists(); });
+$("#track-search-input").addEventListener("input", (event) => {
+  window.clearTimeout(searchTimeout);
+  const query = event.target.value;
+  searchTimeout = window.setTimeout(() => { void searchSongs(query); }, 250);
+});
+$("#rename-playlist").addEventListener("click", () => {
+  $("#playlist-name-input").value = $("#playlist-title").textContent;
+  $("#playlist-name-dialog").showModal();
+  $("#playlist-name-input").focus();
+  $("#playlist-name-input").select();
+});
+$("#playlist-name-save").addEventListener("click", () => { void savePlaylistName(); });
+$("#playlist-name-input").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    void savePlaylistName();
+  }
+});
+document.querySelectorAll("[data-close-dialog]").forEach((button) => {
+  button.addEventListener("click", () => $(`#${button.dataset.closeDialog}`).close());
+});
+document.querySelectorAll("dialog.info-dialog").forEach((dialog) => {
+  dialog.addEventListener("click", (event) => {
+    if (event.target === dialog) dialog.close();
+  });
+});
+$("#playlist-file-input").addEventListener("change", async (event) => {
+  const file = event.target.files[0];
+  if (!file) return;
+  if (file.size > 2_000_000) {
+    showToast("Playlist file is too large (maximum 2 MB).");
+    event.target.value = "";
     return;
   }
-  playTrack(0);
+  try {
+    if (file.name.toLowerCase().endsWith(".csv")) {
+      await importCsvPlaylist(file.name.replace(/\.csv$/i, ""), await file.text());
+    } else {
+      const data = JSON.parse(await file.text());
+      if (data.format !== "sideb-playlist" || data.version !== 1 || !data.playlist) {
+        throw new Error("This is not a supported Side B playlist file.");
+      }
+      loadImportedPlaylist(data.playlist.title, data.playlist.tracks);
+    }
+    $("#playlist-import-dialog").close();
+  } catch (error) {
+    showToast(`Couldn't import playlist: ${error.message}`);
+    console.error("Playlist file import failed.", error);
+  } finally {
+    event.target.value = "";
+  }
 });
 $("#player-play-button").addEventListener("click", togglePlayback);
 $("#next-button").addEventListener("click", nextTrack);
@@ -924,10 +1848,13 @@ $("#info-dialog").addEventListener("click", (event) => {
 document.querySelectorAll(".nav-item").forEach((item) => item.addEventListener("click", () => setView(item.dataset.view)));
 $("#back-to-mix").addEventListener("click", () => setView("mix"));
 $("#clear-collection").addEventListener("click", () => {
-  const storageKey = state.currentView === "discoveries" ? storageKeys.discoveries : storageKeys.saved;
+  const storageKey = state.currentView === "discoveries" ? storageKeys.discoveries
+    : state.currentView === "held" ? storageKeys.held : storageKeys.saved;
   if (!writeStorage(storageKey, [])) return;
   if (state.currentView === "discoveries") {
     state.discoveries = [];
+  } else if (state.currentView === "held") {
+    state.held = {};
   } else {
     state.saved = [];
   }
@@ -945,6 +1872,7 @@ renderPlaylist();
 updateCounts();
 updateSpotifyUi();
 updateDurationControl();
+updateRatioControl();
 $("#redirect-uri").textContent = redirectUri();
 
 async function initializeSpotify() {

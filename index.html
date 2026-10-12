@@ -40,6 +40,11 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.8A1.8 1.8 0 0 1 7.8 3h8.4A1.8 1.8 0 0 1 18 4.8V21l-6-3.7L6 21V4.8Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
             <span>Saved mixes</span>
           </button>
+          <button class="nav-item" data-view="held" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 7v5l3 2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+            <span>Held back</span>
+            <span class="nav-count" id="held-count">0</span>
+          </button>
         </nav>
 
         <div class="sidebar-bottom">
@@ -104,23 +109,34 @@
               </div>
               <div class="duration-control">
                 <div class="duration-label-row"><label class="control-label" for="playlist-length">PLAYLIST LENGTH</label><span class="duration-value" id="duration-value">45 min</span></div>
+                <label class="length-mode-label" for="playlist-length-mode">Measure by</label>
+                <select id="playlist-length-mode" aria-label="Playlist length unit">
+                  <option value="duration">Time</option>
+                  <option value="tracks">Number of songs</option>
+                </select>
                 <input id="playlist-length" type="range" min="15" max="120" step="15" value="45" aria-label="Playlist length in minutes">
                 <div class="duration-legend"><span>15 min</span><span>2 hours</span></div>
               </div>
               <div class="mix-ratio-control">
                 <div class="ratio-label-row"><span class="control-label">THE FAMILIAR / THE NEW</span><span class="ratio-value" id="ratio-value">65% <span>familiar</span></span></div>
                 <div class="range-wrap">
-                  <span class="range-caption">FAMILIAR</span>
                   <input id="mix-ratio" type="range" min="20" max="80" step="5" value="65" aria-label="Familiar songs percentage">
-                  <span class="range-caption">NEW</span>
                 </div>
+                <div class="range-end-labels"><span>NEW</span><span>FAMILIAR</span></div>
                 <div class="range-legend"><span>A few new turns</span><span>Surprise me</span></div>
               </div>
-              <button class="generate-button" id="generate-button" type="button">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10m-6-3 3 3-3 3M20 17H10m6-3-3 3 3 3M14 7l-4 10" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                <span>Make my mix</span>
-                <span class="button-arrow">↗</span>
-              </button>
+              <div class="generate-control">
+                <label class="length-mode-label" for="seed-mode">Manual seed songs</label>
+                <select id="seed-mode" aria-label="How to use manually added seed songs">
+                  <option value="keep">Keep in the next mix</option>
+                  <option value="guide">Use as recommendations only</option>
+                </select>
+                <button class="generate-button" id="generate-button" type="button">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10m-6-3 3 3-3 3M20 17H10m6-3-3 3 3 3M14 7l-4 10" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  <span>Make my mix</span>
+                  <span class="button-arrow">↗</span>
+                </button>
+              </div>
             </div>
           </section>
 
@@ -128,10 +144,15 @@
             <div class="playlist-heading">
               <div class="playlist-title-group">
                 <div class="mix-cover" aria-hidden="true"><span>side<br><b>b</b></span><i></i></div>
-                <div><p class="eyebrow small-eyebrow" id="mix-kicker">MADE FOR YOUR MONTH</p><h2 id="playlist-title">The Long Way Home</h2><p class="playlist-meta"><span id="track-count">12 tracks</span><span class="meta-dot">·</span><span id="mix-runtime">45 min target</span><span class="meta-dot">·</span><span id="mix-date">Just now</span></p></div>
+                <div><p class="eyebrow small-eyebrow" id="mix-kicker">MADE FOR YOUR MONTH</p><div class="playlist-name-row"><h2 id="playlist-title">The Long Way Home</h2><button class="text-button rename-button" id="rename-playlist" type="button">Rename</button></div><p class="playlist-meta"><span id="track-count">12 tracks</span><span class="meta-dot">·</span><span id="mix-runtime">45 min target</span><span class="meta-dot">·</span><span id="mix-date">Just now</span></p></div>
               </div>
               <div class="playlist-actions">
                 <button class="icon-button" id="shuffle-button" type="button" aria-label="Shuffle this mix" title="Shuffle this mix"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 3h5v5m-1-4-6 6M4 7h3c4 0 6 10 10 10h4m-5-4 5 4-5 4M4 17h3c1.4 0 2.5-1 3.5-2.3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+                <button class="save-button" id="add-songs-button" type="button">Add songs</button>
+                <button class="save-button" id="import-playlist-button" type="button">Import</button>
+                <button class="save-button" id="export-playlist-button" type="button">Export</button>
+                <button class="save-button" id="export-csv-button" type="button">CSV</button>
+                <button class="save-button hidden" id="save-local-button" type="button">Save in Side B</button>
                 <button class="save-button" id="save-button" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.8A1.8 1.8 0 0 1 7.8 3h8.4A1.8 1.8 0 0 1 18 4.8V21l-6-3.7L6 21V4.8Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg><span>Save mix</span></button>
                 <button class="play-all-button" id="play-all-button" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 12 7-12 7V5Z" fill="currentColor"/></svg><span>Play mix</span></button>
               </div>
@@ -180,8 +201,42 @@
       <input class="client-id-input" id="client-id-input" type="text" inputmode="text" autocomplete="off" spellcheck="false" placeholder="Paste your Client ID">
       <div class="redirect-box"><span>REGISTER THIS REDIRECT URI IN YOUR SPOTIFY APP</span><code id="redirect-uri"></code><button class="copy-redirect" id="copy-redirect" type="button">Copy</button></div>
       <a class="spotify-doc-link" href="https://developer.spotify.com/dashboard" target="_blank" rel="noreferrer">Open Spotify Developer Dashboard ↗</a>
-      <div class="dialog-note"><strong>Spotify development access</strong><span>Spotify currently requires the app owner to have Premium; development-mode apps are limited to five allowlisted users. Track recommendations and accurate 60% play-progress tracking aren't available through this companion web app.</span></div>
+      <div class="dialog-note"><strong>Spotify playback</strong><span>Start playback from Side B to control a Spotify device and track its reported progress. Spotify Premium and an active Spotify playback device may be required. Bluetooth audio is routed by your phone. Playback, playlist access, and permissions depend on Spotify's current account and API rules.</span></div>
       <div class="dialog-buttons"><button class="dialog-done" id="dialog-done" type="button">Save Client ID</button><button class="dialog-connect" id="dialog-connect" type="button">Save &amp; connect</button></div>
+    </dialog>
+    <dialog id="playlist-name-dialog" class="info-dialog compact-dialog">
+      <button class="dialog-close" data-close-dialog="playlist-name-dialog" type="button" aria-label="Close">×</button>
+      <p class="eyebrow small-eyebrow">YOUR PLAYLIST</p>
+      <h2>Name this playlist</h2>
+      <label class="client-id-label" for="playlist-name-input">PLAYLIST NAME</label>
+      <input class="client-id-input" id="playlist-name-input" maxlength="100" autocomplete="off">
+      <button class="dialog-done dialog-submit" id="playlist-name-save" type="button">Save name</button>
+    </dialog>
+    <dialog id="track-search-dialog" class="info-dialog list-dialog">
+      <button class="dialog-close" data-close-dialog="track-search-dialog" type="button" aria-label="Close">×</button>
+      <p class="eyebrow small-eyebrow">BUILD YOUR MIX</p>
+      <h2>Add songs or seed your next mix</h2>
+      <p>Search the sample catalog or Spotify. Added seed songs can stay in the next mix or guide recommendations only.</p>
+      <input class="client-id-input" id="track-search-input" type="search" placeholder="Search songs or artists" autocomplete="off">
+      <div class="search-result-list" id="search-result-list"></div>
+      <p class="dialog-note"><strong>Seed songs</strong><span>Choose “Use as seed” to remember songs for your next generated mix. Set whether they stay in that mix with the option in the mix builder.</span></p>
+    </dialog>
+    <dialog id="playlist-import-dialog" class="info-dialog list-dialog">
+      <button class="dialog-close" data-close-dialog="playlist-import-dialog" type="button" aria-label="Close">×</button>
+      <p class="eyebrow small-eyebrow">BRING YOUR MUSIC</p>
+      <h2>Import a playlist</h2>
+      <p>Import from Spotify or a Side B JSON/CSV file. Connect Spotify and choose “Export to Spotify” to create a Spotify playlist; Side B matches imported songs and lists anything it cannot find.</p>
+      <label class="client-id-label" for="playlist-file-input">SIDEB PLAYLIST FILE</label>
+      <input class="client-id-input" id="playlist-file-input" type="file" accept="application/json,.json,text/csv,.csv">
+      <button class="secondary-button spotify-playlist-import" id="spotify-playlist-import" type="button">Choose a Spotify playlist</button>
+      <div class="search-result-list" id="spotify-playlist-list"></div>
+    </dialog>
+    <dialog id="unmatched-dialog" class="info-dialog list-dialog compact-dialog">
+      <button class="dialog-close" data-close-dialog="unmatched-dialog" type="button" aria-label="Close">×</button>
+      <p class="eyebrow small-eyebrow">TRANSFER REPORT</p>
+      <h2>Some songs could not be matched</h2>
+      <p id="unmatched-summary">These tracks were left out of the imported playlist.</p>
+      <ul class="unmatched-list" id="unmatched-list"></ul>
     </dialog>
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
   </body>
