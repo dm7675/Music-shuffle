@@ -1,9 +1,10 @@
-const CACHE_NAME = "sideb-app-shell-v13";
+const CACHE_NAME = "sideb-app-shell-v15";
 const APP_SHELL = [
   "./",
   "./index.html",
   "./styles.css",
   "./app.js",
+  "./music-platforms.js",
   "./manifest.json",
   "./icon.svg"
 ];
@@ -26,7 +27,10 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("fetch", (event) => {
   const requestUrl = new URL(event.request.url);
-  if (event.request.method !== "GET" || requestUrl.origin !== self.location.origin || requestUrl.pathname.startsWith("/spotify/")) return;
+  if (event.request.method !== "GET" || requestUrl.origin !== self.location.origin
+    || requestUrl.pathname.startsWith("/spotify/")
+    || requestUrl.pathname.startsWith("/provider-")
+    || requestUrl.pathname === "/platform-config") return;
 
   if (event.request.mode === "navigate") {
     event.respondWith(

@@ -1,9 +1,20 @@
 const http = require("node:http");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const { URL } = require("node:url");
 
 const root = __dirname;
+const localEnvPath = path.join(root, ".env");
+if (fs.existsSync(localEnvPath)) {
+  const localEnvironment = fs.readFileSync(localEnvPath, "utf8");
+  for (const line of localEnvironment.split(/\r?\n/)) {
+    const match = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/.exec(line);
+    if (!match || process.env[match[1]] !== undefined) continue;
+    const value = match[2].replace(/^(['"])(.*)\1$/, "$2");
+    process.env[match[1]] = value;
+  }
+}
 const port = Number(process.env.PORT || 4173);
 const renderHostname = process.env.RENDER_EXTERNAL_HOSTNAME;
 const configuredOrigin = process.env.PUBLIC_ORIGIN || (renderHostname ? `https://${renderHostname}` : "");
@@ -37,6 +48,206 @@ function reject(response, status, message) {
     "Cache-Control": "no-store",
     "X-Content-Type-Options": "nosniff"
   }).end(message);
+}
+
+function base64Url(value) {
+  return Buffer.from(value).toString("base64url");
+}
+
+function createAppleMusicDeveloperToken() {
+  const teamId = process.env.APPLE_MUSIC_TEAM_ID;
+  const keyId = process.env.APPLE_MUSIC_KEY_ID;
+  const privateKey = process.env.APPLE_MUSIC_PRIVATE_KEY?.replace(/\\n/g, "\n");
+  if (!teamId || !keyId || !privateKey) return null;
+
+  const issuedAt = Math.floor(Date.now() / 1000);
+  const header = base64Url(JSON.stringify({ alg: "ES256", kid: keyId }));
+  const payload = base64Url(JSON.stringify({
+    iss: teamId,
+    iat: issuedAt,
+    exp: issuedAt + 60 * 60 * 24 * 180
+  }));
+  const unsignedToken = `${header}.${payload}`;
+  const signature = crypto.sign("sha256", Buffer.from(unsignedToken), {
+    key: privateKey,
+    dsaEncoding: "ieee-p1363"
+  });
+  return `${unsignedToken}.${signature.toString("base64url")}`;
+}
+
+function sendProviderConfig(response) {
+  let appleMusic = { configured: false, developerToken: null };
+  if (process.env.APPLE_MUSIC_TEAM_ID && process.env.APPLE_MUSIC_KEY_ID && process.env.APPLE_MUSIC_PRIVATE_KEY) {
+    try {
+      appleMusic = { configured: true, developerToken: createAppleMusicDeveloperToken() };
+    } catch (error) {
+      console.error("Could not sign the Apple Music developer token:", error.message);
+      reject(response, 500, "Apple Music server credentials are invalid");
+      return;
+    }
+  }
+
+  const config = {
+    spotify: { clientId: process.env.SPOTIFY_CLIENT_ID || "" },
+    appleMusic,
+    tidal: {
+      clientId: process.env.TIDAL_CLIENT_ID || "",
+      configured: Boolean(process.env.TIDAL_CLIENT_ID && process.env.TIDAL_CLIENT_SECRET)
+    },
+    deezer: {
+      appId: process.env.DEEZER_APP_ID || "",
+      configured: Boolean(process.env.DEEZER_APP_ID && process.env.DEEZER_APP_SECRET)
+    },
+    youtubeMusic: {
+      clientId: process.env.YOUTUBE_CLIENT_ID || "",
+      configured: Boolean(process.env.YOUTUBE_CLIENT_ID && process.env.YOUTUBE_CLIENT_SECRET)
+    }
+  };
+  response.writeHead(200, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff"
+  }).end(JSON.stringify(config));
+}
+
+async function forwardRequest(response, targetUrl, request, headers, body) {
+  let upstream;
+  try {
+    upstream = await fetch(targetUrl, {
+      method: request.method,
+      headers,
+      body,
+      signal: AbortSignal.timeout(15_000)
+    });
+  } catch (error) {
+    const timedOut = error.name === "TimeoutError" || error.name === "AbortError";
+    reject(response, 502, timedOut ? "Music provider request timed out" : "Could not reach music provider");
+    console.error(`Music provider request failed for ${new URL(targetUrl).host}:`, error.message);
+    return;
+  }
+
+  const payload = Buffer.from(await upstream.arrayBuffer());
+  response.writeHead(upstream.status, {
+    "Content-Type": upstream.headers.get("content-type") || "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff"
+  }).end(payload);
+}
+
+async function readRequestBody(request, response) {
+  const chunks = [];
+  let bodyBytes = 0;
+  for await (const chunk of request) {
+    bodyBytes += chunk.length;
+    if (bodyBytes > 1_000_000) {
+      reject(response, 413, "Request body too large");
+      return null;
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+async function proxyProviderToken(request, response, requestUrl) {
+  const provider = requestUrl.pathname.split("/")[2];
+  const target = provider === "tidal"
+    ? { host: "auth.tidal.com", path: "/v1/oauth2/token", clientId: process.env.TIDAL_CLIENT_ID, secret: process.env.TIDAL_CLIENT_SECRET }
+    : provider === "youtube"
+      ? { host: "oauth2.googleapis.com", path: "/token", clientId: process.env.YOUTUBE_CLIENT_ID, secret: process.env.YOUTUBE_CLIENT_SECRET }
+      : null;
+  if (!target || !target.clientId || !target.secret) {
+    reject(response, 503, "This music provider is not configured on the server");
+    return;
+  }
+  if (request.method !== "POST" || requestUrl.search) {
+    reject(response, 405, "Method not allowed");
+    return;
+  }
+  const body = await readRequestBody(request, response);
+  if (body === null) return;
+  const form = new URLSearchParams(body.toString("utf8"));
+  if (!["authorization_code", "refresh_token"].includes(form.get("grant_type"))) {
+    reject(response, 400, "Unsupported token grant");
+    return;
+  }
+  form.set("client_id", target.clientId);
+  form.set("client_secret", target.secret);
+  const headers = {
+    Accept: "application/json",
+    "Content-Type": "application/x-www-form-urlencoded"
+  };
+  if (provider === "tidal") {
+    headers.Authorization = `Basic ${Buffer.from(`${target.clientId}:${target.secret}`).toString("base64")}`;
+    form.delete("client_secret");
+  }
+  await forwardRequest(
+    response,
+    `https://${target.host}${target.path}`,
+    { method: request.method },
+    headers,
+    form.toString()
+  );
+}
+
+async function proxyMusicProvider(request, response, requestUrl) {
+  let pathname;
+  try {
+    pathname = decodeURIComponent(requestUrl.pathname);
+  } catch {
+    reject(response, 400, "Invalid provider API path");
+    return;
+  }
+  const segments = pathname.split("/").filter(Boolean);
+  const provider = segments[1];
+  const target = {
+    apple: { host: "api.music.apple.com", prefix: "/v1/" },
+    tidal: { host: "openapi.tidal.com", prefix: "/v2/" },
+    deezer: { host: "api.deezer.com", prefix: "/" },
+    youtube: { host: "www.googleapis.com", prefix: "/youtube/v3/" }
+  }[provider];
+  const targetPath = `/${segments.slice(2).join("/")}`;
+  const methodAllowed = ["GET", "POST", "PUT", "DELETE"].includes(request.method);
+  if (!target || !methodAllowed || !targetPath.startsWith(target.prefix)
+    || targetPath.split("/").some((segment) => segment === "." || segment === ".." || segment.includes("\\"))) {
+    reject(response, 404, "Music provider API route not found");
+    return;
+  }
+  if (provider === "apple" && !process.env.APPLE_MUSIC_TEAM_ID) {
+    reject(response, 503, "Apple Music is not configured on the server");
+    return;
+  }
+  if (provider === "tidal" && !process.env.TIDAL_CLIENT_ID) {
+    reject(response, 503, "TIDAL is not configured on the server");
+    return;
+  }
+  if (provider === "deezer" && !process.env.DEEZER_APP_ID) {
+    reject(response, 503, "Deezer is not configured on the server");
+    return;
+  }
+  if (provider === "youtube" && !process.env.YOUTUBE_CLIENT_ID) {
+    reject(response, 503, "YouTube is not configured on the server");
+    return;
+  }
+
+  const authorization = request.headers.authorization;
+  const headers = { Accept: "application/json" };
+  if (authorization && provider !== "deezer") headers.Authorization = authorization;
+  if (provider === "apple" && request.headers["music-user-token"]) {
+    headers["Music-User-Token"] = request.headers["music-user-token"];
+  }
+  if (request.headers["content-type"]) headers["Content-Type"] = request.headers["content-type"];
+
+  const upstreamUrl = new URL(`https://${target.host}${targetPath}`);
+  upstreamUrl.search = requestUrl.search;
+  if (provider === "deezer" && authorization?.startsWith("Bearer ")) {
+    upstreamUrl.searchParams.set("access_token", authorization.slice("Bearer ".length));
+  }
+  if (provider === "youtube" && process.env.YOUTUBE_API_KEY) {
+    upstreamUrl.searchParams.set("key", process.env.YOUTUBE_API_KEY);
+  }
+  const body = ["GET", "HEAD"].includes(request.method) ? undefined : await readRequestBody(request, response);
+  if (body === null) return;
+  await forwardRequest(response, upstreamUrl, request, headers, body);
 }
 
 async function proxySpotify(request, response, requestUrl) {
@@ -119,6 +330,19 @@ http.createServer(async (request, response) => {
   const origin = request.headers.origin;
   if (origin && origin !== expectedOrigin) {
     reject(response, 403, "Cross-origin requests are not allowed");
+    return;
+  }
+
+  if (requestUrl.pathname === "/platform-config" && request.method === "GET") {
+    sendProviderConfig(response);
+    return;
+  }
+  if (/^\/provider-token\/(tidal|youtube)$/.test(requestUrl.pathname)) {
+    await proxyProviderToken(request, response, requestUrl);
+    return;
+  }
+  if (/^\/provider-api\/(apple|tidal|deezer|youtube)\//.test(requestUrl.pathname)) {
+    await proxyMusicProvider(request, response, requestUrl);
     return;
   }
 

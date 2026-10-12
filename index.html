@@ -13,6 +13,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="styles.css">
+    <script src="music-platforms.js" defer></script>
     <script src="app.js" defer></script>
   </head>
   <body>
@@ -72,6 +73,7 @@
               <span>Connect Spotify</span>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
             </button>
+            <button class="spotify-connect platforms-button" id="platforms-button" type="button">More platforms</button>
           </div>
         </header>
 
@@ -204,6 +206,14 @@
       <a class="spotify-doc-link" href="https://developer.spotify.com/dashboard" target="_blank" rel="noreferrer">Open Spotify Developer Dashboard ↗</a>
       <div class="dialog-note"><strong>Spotify playback</strong><span>Start playback from Side B to control a Spotify device and track its reported progress. Spotify Premium and an active Spotify playback device may be required. Bluetooth audio is routed by your phone. Playback, playlist access, and permissions depend on Spotify's current account and API rules.</span></div>
       <div class="dialog-buttons"><button class="dialog-done" id="dialog-done" type="button">Save Client ID</button><button class="dialog-connect" id="dialog-connect" type="button">Save &amp; connect</button></div>
+    </dialog>
+    <dialog id="platforms-dialog" class="info-dialog list-dialog">
+      <button class="dialog-close" data-close-dialog="platforms-dialog" type="button" aria-label="Close">×</button>
+      <p class="eyebrow small-eyebrow">YOUR MUSIC ACCOUNTS</p>
+      <h2>Connect a platform</h2>
+      <p>Connect is enabled after the Side B operator configures that provider's app credentials. YouTube Data API has a free quota, but still needs a Google Cloud OAuth app. YouTube Music has no official API. Your music account password stays with its provider.</p>
+      <div class="platform-list" id="platform-list"></div>
+      <p class="dialog-note"><strong>YouTube Music support</strong><span>YouTube does not provide an official YouTube Music API. Side B uses the official YouTube Data API for YouTube playlists and music-video search; listening history and playback control are not available.</span></p>
     </dialog>
     <dialog id="playlist-name-dialog" class="info-dialog compact-dialog">
       <button class="dialog-close" data-close-dialog="playlist-name-dialog" type="button" aria-label="Close">×</button>

@@ -178,7 +178,7 @@ function shuffle(items) {
 }
 
 function spotifyClientId() {
-  return localStorage.getItem(storageKeys.clientId) || "";
+  return localStorage.getItem(storageKeys.clientId) || SideBMusicPlatforms.clientId("spotify") || "";
 }
 
 function redirectUri() {
@@ -219,6 +219,7 @@ function writeSpotifySession(session) {
 }
 
 async function authorizeSpotify() {
+  await SideBMusicPlatforms.loadConfig();
   const clientId = spotifyClientId().trim();
   if (!clientId) {
     openSpotifyDialog();
@@ -314,6 +315,7 @@ async function spotifyRequest(endpoint, options = {}) {
 }
 
 async function handleSpotifyCallback() {
+  if (SideBMusicPlatforms.hasPendingRedirect()) return false;
   const params = new URLSearchParams(window.location.search);
   const code = params.get("code");
   const returnedState = params.get("state");
@@ -365,13 +367,18 @@ function updateSpotifyUi() {
 }
 
 function openSpotifyDialog() {
+  const serverConfigured = Boolean(SideBMusicPlatforms.clientId("spotify"));
+  $("#client-id-input").hidden = serverConfigured;
+  $(".client-id-label[for='client-id-input']").hidden = serverConfigured;
   $("#client-id-input").value = spotifyClientId();
   $("#redirect-uri").textContent = redirectUri();
   $("#dialog-description").textContent = state.spotifyUser
     ? `Connected as ${state.spotifyUser.display_name || state.spotifyUser.id}. Reconnect to approve playback and playlist permissions, or disconnect this browser tab.`
-    : "Create a Spotify developer app, then paste its Client ID here. Sign-in uses Spotify's PKCE flow; this app never asks for your Spotify password or a client secret.";
-  $("#dialog-done").textContent = state.spotifyUser ? "Disconnect" : "Save Client ID";
-  $("#dialog-connect").textContent = state.spotifyUser ? "Reconnect" : "Save & connect";
+    : serverConfigured
+      ? "Connect your Spotify account. Side B uses its registered Spotify app; your Spotify password and account remain with Spotify."
+      : "Create a Spotify developer app, then paste its Client ID here. Sign-in uses Spotify's PKCE flow; this app never asks for your Spotify password or a client secret.";
+  $("#dialog-done").textContent = state.spotifyUser ? "Disconnect" : serverConfigured ? "Close" : "Save Client ID";
+  $("#dialog-connect").textContent = state.spotifyUser ? "Reconnect" : serverConfigured ? "Connect Spotify" : "Save & connect";
   $("#info-dialog").showModal();
 }
 
@@ -1683,6 +1690,70 @@ function showToast(message) {
   toastTimeout = window.setTimeout(() => toast.classList.remove("visible"), 2800);
 }
 
+function renderPlatformConnections(config) {
+  const list = $("#platform-list");
+  list.replaceChildren();
+  Object.entries(SideBMusicPlatforms.providers).forEach(([id, provider]) => {
+    const providerConfig = config[id];
+    const session = SideBMusicPlatforms.readSession(id);
+    const connected = id === "appleMusic"
+      ? Boolean(session?.musicUserToken)
+      : Boolean(session?.access_token);
+    const configured = id === "appleMusic"
+      ? Boolean(providerConfig?.developerToken)
+      : Boolean(providerConfig?.configured);
+    const card = document.createElement("div");
+    card.className = "platform-card";
+    const copy = document.createElement("div");
+    copy.className = "platform-copy";
+    const title = document.createElement("strong");
+    title.textContent = provider.name;
+    const status = document.createElement("small");
+    status.textContent = connected ? "Connected in this browser tab"
+      : configured ? "Ready to connect" : "App setup required";
+    copy.append(title, status);
+    const action = document.createElement("button");
+    action.type = "button";
+    action.className = "secondary-button platform-action";
+    action.textContent = connected ? "Disconnect" : "Connect";
+    action.disabled = !connected && !configured;
+    action.addEventListener("click", () => {
+      if (connected) {
+        SideBMusicPlatforms.clearSession(id);
+        renderPlatformConnections(config);
+        showToast(`${provider.name} disconnected from this browser tab.`);
+        return;
+      }
+      action.disabled = true;
+      action.textContent = "Connecting…";
+      void SideBMusicPlatforms.beginConnection(id).then((profile) => {
+        if (profile) {
+          renderPlatformConnections(config);
+          showToast(`Connected to ${provider.name}.`);
+        }
+      }).catch((error) => {
+        action.disabled = false;
+        action.textContent = "Connect";
+        showToast(`Couldn't connect ${provider.name}: ${error.message}`);
+        console.error(`${provider.name} connection failed.`, error);
+      });
+    });
+    card.append(copy, action);
+    if (!configured) {
+      const setup = document.createElement("p");
+      setup.className = "platform-setup";
+      setup.textContent = provider.setup;
+      const docs = document.createElement("a");
+      docs.href = provider.docs;
+      docs.target = "_blank";
+      docs.rel = "noreferrer";
+      docs.textContent = `Developer setup ↗`;
+      card.append(setup, docs);
+    }
+    list.append(card);
+  });
+}
+
 document.querySelectorAll("[data-period]").forEach((button) => {
   button.addEventListener("click", () => {
     selectPeriod(button.dataset.period);
@@ -1806,21 +1877,43 @@ $("#connect-button").addEventListener("click", () => {
       showToast(`Spotify connection failed: ${error.message}`);
       console.error("Spotify connection retry failed.", error);
     });
-  } else if (spotifyClientId()) {
+  } else {
     state.spotifyConnecting = true;
     updateSpotifyUi();
-    void authorizeSpotify().catch((error) => {
+    void SideBMusicPlatforms.loadConfig().then(() => {
+      if (!spotifyClientId()) {
+        state.spotifyConnecting = false;
+        updateSpotifyUi();
+        openSpotifyDialog();
+        return;
+      }
+      return authorizeSpotify();
+    }).catch((error) => {
       state.spotifyConnecting = false;
       state.spotifyError = error.message;
       updateSpotifyUi();
       showToast(`Couldn't start Spotify sign-in: ${error.message}`);
       console.error("Spotify sign-in could not start.", error);
     });
-  } else {
-    openSpotifyDialog();
   }
 });
-$("#profile-button").addEventListener("click", openSpotifyDialog);
+$("#platforms-button").addEventListener("click", () => {
+  $("#platforms-dialog").showModal();
+  void SideBMusicPlatforms.loadConfig().then(renderPlatformConnections).catch((error) => {
+    const list = $("#platform-list");
+    const message = document.createElement("p");
+    message.className = "search-empty";
+    message.textContent = `Music platform setup could not be loaded: ${error.message}`;
+    list.replaceChildren(message);
+    console.error("Music platform setup could not be loaded.", error);
+  });
+});
+$("#profile-button").addEventListener("click", () => {
+  void SideBMusicPlatforms.loadConfig().then(openSpotifyDialog).catch((error) => {
+    showToast(`Couldn't load Spotify app settings: ${error.message}`);
+    console.error("Spotify app settings could not be loaded.", error);
+  });
+});
 $("#dialog-close").addEventListener("click", () => $("#info-dialog").close());
 $("#dialog-done").addEventListener("click", () => {
   if (state.spotifyUser) {
@@ -1850,17 +1943,19 @@ $("#dialog-done").addEventListener("click", () => {
 });
 $("#dialog-connect").addEventListener("click", () => {
   const clientId = $("#client-id-input").value.trim();
-  if (!clientId) {
+  if (!clientId && !spotifyClientId()) {
     showToast("Paste your Spotify Client ID first.");
     $("#client-id-input").focus();
     return;
   }
-  try {
-    localStorage.setItem(storageKeys.clientId, clientId);
-  } catch (error) {
-    showToast("Couldn't save the Client ID in this browser.");
-    console.error("Could not save the Spotify Client ID.", error);
-    return;
+  if (clientId) {
+    try {
+      localStorage.setItem(storageKeys.clientId, clientId);
+    } catch (error) {
+      showToast("Couldn't save the Client ID in this browser.");
+      console.error("Could not save the Spotify Client ID.", error);
+      return;
+    }
   }
   $("#info-dialog").close();
   void authorizeSpotify().catch((error) => {
@@ -1912,6 +2007,20 @@ $("#redirect-uri").textContent = redirectUri();
 
 async function initializeSpotify() {
   try {
+    const connectedProvider = await SideBMusicPlatforms.handleRedirect();
+    if (connectedProvider) {
+      const config = await SideBMusicPlatforms.loadConfig();
+      renderPlatformConnections(config);
+      showToast(`Connected to ${SideBMusicPlatforms.providers[connectedProvider].name}.`);
+    }
+  } catch (error) {
+    showToast(`Music platform sign-in failed: ${error.message}`);
+    console.error("Music platform sign-in could not be completed.", error);
+  }
+  try {
+    if (new URLSearchParams(window.location.search).has("code") || readSpotifySession()?.access_token) {
+      await SideBMusicPlatforms.loadConfig();
+    }
     await handleSpotifyCallback();
     if (!readSpotifySession()?.access_token) return;
     state.spotifyConnecting = true;
@@ -1949,7 +2058,8 @@ async function reconnectSpotify() {
   }
 }
 
-if (new URLSearchParams(window.location.search).has("code") || readSpotifySession()?.access_token) {
+if ((new URLSearchParams(window.location.search).has("code") && !SideBMusicPlatforms.hasPendingRedirect())
+  || readSpotifySession()?.access_token) {
   state.spotifyConnecting = true;
   updateSpotifyUi();
 }
