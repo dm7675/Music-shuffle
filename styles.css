@@ -281,6 +281,8 @@ input[type="range"]::-moz-range-thumb { width: 9px; height: 9px; border: 2px sol
 .dialog-connect:hover { background: #d1f88c; }
 .toast { position: fixed; z-index: 10; left: 50%; bottom: 92px; max-width: calc(100% - 30px); padding: 10px 15px; border: 1px solid #49513e; border-radius: 6px; color: #e9f2d9; background: #24291f; box-shadow: 0 8px 28px #0008; font-size: 10px; opacity: 0; transform: translate(-50%, 8px); pointer-events: none; transition: opacity .2s, transform .2s; }
 .toast.visible { opacity: 1; transform: translate(-50%, 0); }
+.toast.has-action.visible { pointer-events: auto; }
+.toast-action { margin-left: 8px; color: var(--lime); font-weight: 700; white-space: nowrap; }
 
 @media (min-width: 1450px) {
   .main-content { padding-inline: 65px; }

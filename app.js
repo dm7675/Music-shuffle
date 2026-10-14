@@ -39,6 +39,7 @@ const spotifyScopes = [
   "user-read-recently-played",
   "user-read-playback-state",
   "user-modify-playback-state",
+  "streaming",
   "playlist-read-private",
   "playlist-read-collaborative",
   "playlist-modify-private"
@@ -70,8 +71,13 @@ const state = {
   spotifyConnecting: false,
   spotifyTopTracks: [],
   spotifyTopArtists: [],
-  spotifyPlaylist: null
+  spotifyPlaylist: null,
+  webPlayer: null,
+  webPlayerDeviceId: null,
+  pendingSpotifyPlay: null
 };
+const isMobileBrowser = navigator.userAgentData?.mobile === true
+  || /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
 
 const $ = (selector) => document.querySelector(selector);
 const trackList = $("#track-list");
@@ -268,6 +274,7 @@ async function exchangeSpotifyToken(body) {
   const session = {
     access_token: payload.access_token,
     refresh_token: payload.refresh_token || previousSession?.refresh_token || null,
+    scope: payload.scope || previousSession?.scope || "",
     expires_at: Date.now() + payload.expires_in * 1000
   };
   if (!writeSpotifySession(session)) throw new Error("Could not store your Spotify session in this browser tab.");
@@ -1266,25 +1273,152 @@ function stopPlayback() {
   $("#player-play-button").innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 12 7-12 7V5Z" fill="currentColor"/></svg>';
 }
 
-async function getSpotifyPlaybackDevice() {
-  const result = await spotifyRequest("/me/player/devices");
-  const devices = result.devices || [];
-  const device = devices.find((candidate) => candidate.is_active && !candidate.is_restricted)
-    || devices.find((candidate) => !candidate.is_restricted);
-  if (device) return device.id;
-  if (devices.length) {
-    throw new Error("Spotify has no controllable playback device available. Open Spotify on your phone or computer and make sure it is online.");
-  }
-  throw new Error("Spotify reports no playback devices. Open the Spotify app on your phone or computer, start a song once, leave Spotify open, then try again. Side B controls Spotify; it does not stream audio itself.");
+function hasSpotifyScope(scope) {
+  return (readSpotifySession()?.scope || "").split(" ").includes(scope);
 }
+
+let spotifySdkPromise = null;
+function loadSpotifySdk() {
+  if (window.Spotify?.Player) return Promise.resolve(window.Spotify);
+  if (spotifySdkPromise) return spotifySdkPromise;
+  spotifySdkPromise = new Promise((resolve, reject) => {
+    window.onSpotifyWebPlaybackSDKReady = () => resolve(window.Spotify);
+    const script = document.createElement("script");
+    script.src = "https://sdk.scdn.co/spotify-player.js";
+    script.async = true;
+    script.onerror = () => {
+      spotifySdkPromise = null;
+      reject(new Error("Couldn't load Spotify's web player."));
+    };
+    document.head.append(script);
+  });
+  return spotifySdkPromise;
+}
+
+// Desktop browsers can register this tab as its own Spotify Connect device (Premium only).
+// Mobile browsers aren't supported by the SDK, so phones hand off to the Spotify app instead.
+async function initSpotifyWebPlayer() {
+  if (isMobileBrowser || state.webPlayer || !state.spotifyUser) return;
+  if (!hasSpotifyScope("streaming")) {
+    console.info("Spotify session lacks the streaming scope; reconnect Spotify to play in this browser.");
+    return;
+  }
+  const Spotify = await loadSpotifySdk();
+  const player = new Spotify.Player({
+    name: "Side B (browser)",
+    volume: 0.8,
+    getOAuthToken: (callback) => {
+      void getSpotifyAccessToken().then(callback).catch((error) => {
+        console.error("Spotify web player could not get a token.", error);
+      });
+    }
+  });
+  const disableWebPlayer = (message) => (error) => {
+    state.webPlayerDeviceId = null;
+    console.error(message, error);
+  };
+  player.addListener("ready", ({ device_id: deviceId }) => {
+    state.webPlayerDeviceId = deviceId;
+  });
+  player.addListener("not_ready", () => {
+    state.webPlayerDeviceId = null;
+  });
+  player.addListener("initialization_error", disableWebPlayer("Spotify web player isn't supported in this browser."));
+  player.addListener("authentication_error", disableWebPlayer("Spotify web player authentication failed."));
+  player.addListener("account_error", (error) => {
+    disableWebPlayer("Spotify web player requires Premium.")(error);
+    showToast("Playing in the browser needs Spotify Premium. Side B will control your Spotify app instead.");
+  });
+  player.addListener("playback_error", (error) => console.error("Spotify web player playback error.", error));
+  state.webPlayer = player;
+  if (!await player.connect()) {
+    state.webPlayer = null;
+    throw new Error("Spotify's web player couldn't connect.");
+  }
+}
+
+function disconnectSpotifyWebPlayer() {
+  state.webPlayer?.disconnect();
+  state.webPlayer = null;
+  state.webPlayerDeviceId = null;
+  clearPendingSpotifyPlay();
+}
+
+async function findSpotifyPlaybackDevice() {
+  const result = await spotifyRequest("/me/player/devices");
+  const devices = (result.devices || []).filter((candidate) => !candidate.is_restricted);
+  const device = devices.find((candidate) => candidate.is_active)
+    || devices.find((candidate) => candidate.id === state.webPlayerDeviceId)
+    || devices[0];
+  // A freshly connected web player can take a moment to show up in the device list.
+  return device?.id || state.webPlayerDeviceId || null;
+}
+
+let pendingPlayTimer = null;
+function clearPendingSpotifyPlay() {
+  state.pendingSpotifyPlay = null;
+  if (pendingPlayTimer) window.clearInterval(pendingPlayTimer);
+  pendingPlayTimer = null;
+}
+
+function promptOpenSpotifyApp(index, playlistUri) {
+  clearPendingSpotifyPlay();
+  state.pendingSpotifyPlay = { index, playlistUri, expiresAt: Date.now() + 120_000 };
+  pendingPlayTimer = window.setInterval(() => void retryPendingSpotifyPlay(), 2000);
+  const appUri = playlistUri || state.playlist[index]?.spotifyUri || "spotify:";
+  const message = isMobileBrowser
+    ? "Spotify isn't running on this phone yet. Open it, then come back. Side B will start your mix."
+    : "No Spotify device is online. Open the Spotify app and Side B will start your mix there.";
+  showToast(message, { label: "Open Spotify", href: appUri });
+}
+
+let pendingRetryBusy = false;
+async function retryPendingSpotifyPlay() {
+  const pending = state.pendingSpotifyPlay;
+  if (!pending || pendingRetryBusy) return;
+  if (Date.now() > pending.expiresAt) {
+    clearPendingSpotifyPlay();
+    return;
+  }
+  pendingRetryBusy = true;
+  try {
+    if (!await findSpotifyPlaybackDevice()) return;
+    clearPendingSpotifyPlay();
+    await startSpotifyPlayback(pending.index, pending.playlistUri);
+    showToast("Your mix is playing in Spotify.");
+  } catch (error) {
+    clearPendingSpotifyPlay();
+    showToast(`Couldn't start Spotify playback: ${error.message}`);
+    console.error("Pending Spotify playback could not start.", error);
+  } finally {
+    pendingRetryBusy = false;
+  }
+}
+
+function startSpotifyWebPlayer() {
+  void initSpotifyWebPlayer().catch((error) => {
+    console.error("Spotify web player could not start.", error);
+  });
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") void retryPendingSpotifyPlay();
+});
 
 async function startSpotifyPlayback(index, playlistUri = null) {
   if (!state.spotifyUser) throw new Error("Connect Spotify before starting full-track playback.");
+  // Must run synchronously inside the click so browsers allow the web player to make sound.
+  void state.webPlayer?.activateElement?.();
   const uris = state.playlist.map((track) => track.spotifyUri);
   if (!playlistUri && (!uris.length || uris.some((uri) => !uri))) {
     throw new Error("Every song in this mix needs a Spotify match for full-track playback.");
   }
-  const deviceId = await getSpotifyPlaybackDevice();
+  const deviceId = await findSpotifyPlaybackDevice();
+  if (!deviceId) {
+    promptOpenSpotifyApp(index, playlistUri);
+    return;
+  }
+  clearPendingSpotifyPlay();
   if (state.remoteTimer) window.clearInterval(state.remoteTimer);
   state.remoteTimer = null;
   await spotifyRequest(`/me/player/play?device_id=${encodeURIComponent(deviceId)}`, {
@@ -1682,12 +1816,20 @@ function renderCollection() {
 }
 
 let toastTimeout;
-function showToast(message) {
+function showToast(message, action = null) {
   const toast = $("#toast");
   toast.textContent = message;
+  toast.classList.toggle("has-action", Boolean(action));
+  if (action) {
+    const link = document.createElement("a");
+    link.className = "toast-action";
+    link.href = action.href;
+    link.textContent = action.label;
+    toast.append(" ", link);
+  }
   toast.classList.add("visible");
   window.clearTimeout(toastTimeout);
-  toastTimeout = window.setTimeout(() => toast.classList.remove("visible"), 2800);
+  toastTimeout = window.setTimeout(() => toast.classList.remove("visible"), action ? 12_000 : 2800);
 }
 
 function renderPlatformConnections(config) {
@@ -1918,6 +2060,7 @@ $("#dialog-close").addEventListener("click", () => $("#info-dialog").close());
 $("#dialog-done").addEventListener("click", () => {
   if (state.spotifyUser) {
     sessionStorage.removeItem(spotifyTokenKey);
+    disconnectSpotifyWebPlayer();
     state.spotifyUser = null;
     state.spotifyPlaylist = null;
     state.spotifyTopTracks = [];
@@ -2030,6 +2173,7 @@ async function initializeSpotify() {
     state.spotifyError = null;
     updateSpotifyUi();
     showToast(`Connected to Spotify as ${state.spotifyUser.display_name || state.spotifyUser.id}.`);
+    startSpotifyWebPlayer();
     selectPeriod(state.period);
     await buildMix();
   } catch (error) {
@@ -2050,6 +2194,7 @@ async function reconnectSpotify() {
     state.spotifyUser = await spotifyRequest("/me");
     state.spotifyError = null;
     updateSpotifyUi();
+    startSpotifyWebPlayer();
     await buildMix();
   } finally {
     state.spotifyConnecting = false;
