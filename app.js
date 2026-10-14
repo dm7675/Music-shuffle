@@ -74,8 +74,10 @@ const state = {
   spotifyPlaylist: null,
   webPlayer: null,
   webPlayerDeviceId: null,
-  pendingSpotifyPlay: null
+  pendingSpotifyPlay: null,
+  listenSession: null
 };
+const heardThreshold = 0.6;
 const isMobileBrowser = navigator.userAgentData?.mobile === true
   || /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
 
@@ -126,13 +128,41 @@ function markTrackHeard(track) {
   updateCounts();
 }
 
+function listenedSeconds(track) {
+  return state.listenSession?.trackId === track?.id ? state.listenSession.listened : 0;
+}
+
+// Counts time actually spent listening, so seeking or resuming mid-song doesn't count as hearing it.
+function recordListening(track, positionSeconds, isPlaying) {
+  const now = Date.now();
+  let session = state.listenSession;
+  if (!session || session.trackId !== track.id) {
+    session = state.listenSession = {
+      trackId: track.id,
+      listened: isPlaying && positionSeconds <= 5 ? positionSeconds : 0,
+      lastPosition: positionSeconds,
+      lastCheckedAt: now
+    };
+  } else {
+    const progressed = positionSeconds - session.lastPosition;
+    const wallSeconds = (now - session.lastCheckedAt) / 1000;
+    if (isPlaying && progressed > 0 && progressed <= wallSeconds + 2) session.listened += progressed;
+    session.lastPosition = positionSeconds;
+    session.lastCheckedAt = now;
+  }
+  if (session.counted || session.listened / track.duration < heardThreshold) return;
+  session.counted = true;
+  markTrackHeard(track);
+  if (track.type === "discovery") saveDiscovery(track);
+}
+
 function holdSkippedTrack(track, progressSeconds) {
   if (!track?.id) return;
   const previous = state.held[track.id];
   const skipCount = (previous?.skipCount || 0) + 1;
   const holdDays = Math.min(30, 3 * (2 ** (skipCount - 1)));
   const heldUntil = new Date(Date.now() + holdDays * 24 * 60 * 60 * 1000).toISOString();
-  const heard = progressSeconds / track.duration >= 0.6;
+  const heard = listenedSeconds(track) / track.duration >= heardThreshold;
   if (heard) markTrackHeard(track);
   const nextHeld = {
     ...state.held,
@@ -1204,6 +1234,7 @@ function playTrack(index) {
   if (!state.playlist[index]) return;
   state.activeIndex = index;
   state.elapsed = 0;
+  state.listenSession = null;
   stopPlayback();
   const track = state.playlist[index];
   $("#player-track").textContent = track.title;
@@ -1233,10 +1264,7 @@ function advancePlayback() {
   state.elapsed += 1;
   $("#current-time").textContent = formatTime(state.elapsed);
   $("#progress-fill").style.width = `${Math.min(state.elapsed / track.duration * 100, 100)}%`;
-  if (state.elapsed / track.duration >= 0.6) {
-    markTrackHeard(track);
-    if (track.type === "discovery") saveDiscovery(track);
-  }
+  recordListening(track, state.elapsed, true);
   if (state.elapsed >= track.duration) {
     playTrack((state.activeIndex + 1) % state.playlist.length);
   }
@@ -1429,6 +1457,7 @@ async function startSpotifyPlayback(index, playlistUri = null) {
   });
   state.activeIndex = index;
   state.elapsed = 0;
+  state.listenSession = null;
   state.remotePlayback = true;
   state.lastRemoteTrackId = state.playlist[index].id;
   $("#player-bar").classList.add("is-playing");
@@ -1468,10 +1497,7 @@ async function pollSpotifyPlayback() {
   $("#player-play-button").innerHTML = playback.is_playing
     ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5h4v14H7zm7 0h4v14h-4z" fill="currentColor"/></svg>'
     : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 12 7-12 7V5Z" fill="currentColor"/></svg>';
-  if (state.elapsed / track.duration >= 0.6) {
-    markTrackHeard(track);
-    if (track.type === "discovery") saveDiscovery(track);
-  }
+  recordListening(track, state.elapsed, Boolean(playback.is_playing));
   updateSpotifyUi();
   renderPlaylist();
 }
