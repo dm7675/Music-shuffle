@@ -30,7 +30,10 @@ const storageKeys = {
   clientId: "sideb-spotify-client-id-v1",
   held: "sideb-held-v1",
   heard: "sideb-heard-v1",
-  seeds: "sideb-seeds-v1"
+  seeds: "sideb-seeds-v1",
+  pickMode: "sideb-pick-mode-v1",
+  likedTracks: "sideb-liked-tracks-v1",
+  savedUpdatedAt: "sideb-saved-updated-v1"
 };
 const spotifyTokenKey = "sideb-spotify-session-v1";
 const spotifyScopes = [
@@ -54,10 +57,12 @@ const state = {
   saved: readStorage(storageKeys.saved, []),
   discoveries: readStorage(storageKeys.discoveries, []),
   liked: readStorage(storageKeys.likes, []),
+  // Song details for liked ids, so the Liked list can show and play them.
+  likedTracks: readStorage(storageKeys.likedTracks, {}),
   held: readHeldTracks(),
   heard: readStorage(storageKeys.heard, []),
   seedTracks: readStorage(storageKeys.seeds, []),
-  seedMode: "keep",
+  seedMode: readStorage(storageKeys.pickMode, "keep"),
   activeIndex: -1,
   elapsed: 0,
   timer: null,
@@ -77,7 +82,8 @@ const state = {
   pendingSpotifyPlay: null,
   listenSession: null
 };
-const heardThreshold = 0.6;
+const listeningRules = window.SideBListeningRules;
+const { heardThreshold, songKey } = listeningRules;
 const isMobileBrowser = navigator.userAgentData?.mobile === true
   || /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
 
@@ -113,17 +119,20 @@ function writeStorage(key, value) {
   return true;
 }
 
-// Expired holds stay stored so repeated skips keep lengthening the cooldown.
-function isHoldActive(entry) {
-  return Boolean(entry && (entry.blocked || Date.parse(entry.heldUntil) > Date.now()));
-}
-
 function activeHeldEntries() {
-  return Object.values(state.held).filter(isHoldActive);
+  return Object.values(state.held).filter((entry) => listeningRules.isHoldActive(entry));
 }
 
+// A hold covers every release of the song, not only the one that was skipped.
 function isTrackUnavailable(track) {
-  return isHoldActive(state.held[track.id]);
+  if (listeningRules.isHoldActive(state.held[track.id])) return true;
+  const key = songKey(track);
+  return Boolean(key) && activeHeldEntries().some((entry) => songKey(entry.track) === key);
+}
+
+function sameSongIn(list, track) {
+  const key = songKey(track);
+  return list.find((candidate) => candidate.id === track.id || (key && songKey(candidate) === key));
 }
 
 function markTrackHeard(track) {
@@ -165,39 +174,56 @@ function recordListening(track, positionSeconds, isPlaying) {
   }
   if (session.counted || session.listened / track.duration < heardThreshold) return;
   session.counted = true;
-  markTrackHeard(track);
-  if (track.type === "discovery") saveDiscovery(track);
+  recordHeard(track);
 }
 
 function holdSkippedTrack(track, progressSeconds) {
   if (!track?.id) return;
   // A song heard past 60% counts as listened, so moving on from it isn't a skip.
   if (listenedSeconds(track) / track.duration >= heardThreshold) {
-    markTrackHeard(track);
-    if (track.type === "discovery") saveDiscovery(track);
+    // Usually already counted the moment it passed 60%; only count it here if that was missed.
+    if (!state.listenSession?.counted) recordHeard(track);
     return;
   }
-  const previous = state.held[track.id];
-  const skipCount = (previous?.skipCount || 0) + 1;
-  const holdDays = Math.min(30, 3 * (2 ** (skipCount - 1)));
-  const heldUntil = new Date(Date.now() + holdDays * 24 * 60 * 60 * 1000).toISOString();
-  const nextHeld = {
-    ...state.held,
-    [track.id]: {
-      track,
-      skipCount,
-      heldUntil,
-      earlySkip: progressSeconds / track.duration < 0.3,
-      blocked: false,
-      lastSkippedAt: new Date().toISOString()
-    }
-  };
-  if (!writeStorage(storageKeys.held, nextHeld)) return;
+  const progressRatio = progressSeconds / track.duration;
+  const hold = applyHold(track, progressRatio);
+  if (!hold) return;
+  rememberAppListen(track);
+  reportListening({ type: "skip", track: accountTrack(track), progressRatio });
+  showToast(hold.earlySkip
+    ? `"${track.title}" was skipped early and held back for ${hold.holdDays} days.`
+    : `"${track.title}" was held back for ${hold.holdDays} days after the skip.`);
+}
+
+// Returns the new hold, or null when the song is blocked: a blocked song stays blocked.
+function applyHold(track, progressRatio) {
+  if (state.held[track.id]?.blocked) return null;
+  const { holdDays, ...hold } = listeningRules.nextHold(state.held[track.id], progressRatio);
+  const nextHeld = { ...state.held, [track.id]: { track, ...hold } };
+  if (!writeStorage(storageKeys.held, nextHeld)) return null;
   state.held = nextHeld;
   updateCounts();
-  showToast(nextHeld[track.id].earlySkip
-    ? `"${track.title}" was skipped early and held back for ${holdDays} days.`
-    : `"${track.title}" was held back for ${holdDays} days after the skip.`);
+  return { ...hold, holdDays };
+}
+
+// Marks a song heard past 60%, saving it as a discovery when it came from the "new for you" pool.
+function recordHeard(track) {
+  // Only the first listen makes a discovery, so a song removed from Discoveries doesn't come back.
+  const discovery = track.type === "discovery" && !state.heard.includes(track.id);
+  markTrackHeard(track);
+  if (discovery) saveDiscovery(track);
+  rememberAppListen(track);
+  reportListening({ type: "heard", track: accountTrack(track), discovery });
+}
+
+function removeDiscovery(track) {
+  const nextDiscoveries = state.discoveries.filter((discovery) => discovery.id !== track.id);
+  if (!writeStorage(storageKeys.discoveries, nextDiscoveries)) return;
+  state.discoveries = nextDiscoveries;
+  updateCounts();
+  renderCollection();
+  reportListening({ type: "remove-discovery", trackId: track.id });
+  showToast(`Removed "${track.title}" from your discoveries.`);
 }
 
 function releaseHeldTrack(trackId, blocked = false) {
@@ -211,6 +237,7 @@ function releaseHeldTrack(trackId, blocked = false) {
   state.held = nextHeld;
   updateCounts();
   renderCollection();
+  reportListening({ type: "release", trackId, blocked });
   showToast(blocked ? "Song blocked from future mixes." : "Song is eligible for rotation again.");
 }
 
@@ -316,12 +343,16 @@ async function exchangeSpotifyToken(body) {
   if (!response.ok) {
     const error = new Error(payload.error_description || payload.error || `Spotify sign-in failed (${response.status}).`);
     error.status = response.status;
+    error.code = payload.error;
     throw error;
   }
   const previousSession = readSpotifySession();
+  // With a server session, the refresh token stays encrypted on the server and never reaches the browser.
+  const serverSession = Boolean(payload.server_session);
   const session = {
     access_token: payload.access_token,
-    refresh_token: payload.refresh_token || previousSession?.refresh_token || null,
+    refresh_token: serverSession ? null : payload.refresh_token || previousSession?.refresh_token || null,
+    server_session: serverSession,
     scope: payload.scope || previousSession?.scope || "",
     expires_at: Date.now() + payload.expires_in * 1000
   };
@@ -352,18 +383,17 @@ async function getSpotifyAccessToken({ forceRefresh = false } = {}) {
     throw new Error(state.spotifyError || "Connect your Spotify account to continue.");
   }
   if (!forceRefresh && session.expires_at > Date.now() + 30_000) return session.access_token;
-  if (!session.refresh_token) {
+  if (!session.refresh_token && !session.server_session) {
     endSpotifySession();
     throw new Error(spotifyExpiredMessage);
   }
   try {
-    session = await exchangeSpotifyToken({
-      grant_type: "refresh_token",
-      refresh_token: session.refresh_token
-    });
+    session = await exchangeSpotifyToken(session.server_session
+      ? { grant_type: "refresh_token", ...(forceRefresh ? { force: "true" } : {}) }
+      : { grant_type: "refresh_token", refresh_token: session.refresh_token });
   } catch (error) {
-    // Only a rejection from Spotify ends the session; a network failure can be retried.
-    if (error.status) {
+    // Only a rejected sign-in ends the session; network and server hiccups can be retried.
+    if (error.status === 400 || error.status === 401) {
       endSpotifySession();
       throw new Error(spotifyExpiredMessage);
     }
@@ -393,16 +423,361 @@ async function spotifyRequest(endpoint, options = {}, retried = false) {
   }
   if (response.status === 401) {
     // The token can be revoked or expire early; refresh once before giving up on the session.
-    if (!retried && readSpotifySession()?.refresh_token) return spotifyRequest(endpoint, options, true);
+    const session = readSpotifySession();
+    if (!retried && (session?.refresh_token || session?.server_session)) return spotifyRequest(endpoint, options, true);
     endSpotifySession();
     throw new Error(spotifyExpiredMessage);
+  }
+  if (response.status === 429) {
+    const retryAfterSeconds = Number(response.headers.get("retry-after")) || 30;
+    state.spotifyQuietUntil = Date.now() + retryAfterSeconds * 1000;
+    throw new Error(`Spotify asked Side B to slow down; trying again in ${retryAfterSeconds} seconds.`);
   }
   const payload = response.status === 204 ? null : await response.json().catch(() => null);
   if (!response.ok) {
     const reason = payload?.error?.message || payload?.error_description || `Spotify API request failed (${response.status}).`;
-    throw new Error(`${reason} (${endpoint})`);
+    const error = new Error(`${reason} (${endpoint})`);
+    error.status = response.status;
+    error.reason = payload?.error?.reason;
+    throw error;
   }
   return payload;
+}
+
+function playableUris() {
+  return state.playlist.map((track) => track.spotifyUri).filter(Boolean);
+}
+
+// Spotify accepts at most 100 songs per request.
+async function replacePlaylistItems(playlistId, uris) {
+  const endpoint = `/playlists/${encodeURIComponent(playlistId)}/items`;
+  await spotifyRequest(endpoint, { method: "PUT", body: JSON.stringify({ uris: uris.slice(0, 100) }) });
+  for (let start = 100; start < uris.length; start += 100) {
+    await spotifyRequest(endpoint, { method: "POST", body: JSON.stringify({ uris: uris.slice(start, start + 100) }) });
+  }
+}
+
+// The first song from index onward (wrapping around) that Spotify can play.
+function playableIndexFrom(index, step = 1) {
+  const count = state.playlist.length;
+  for (let offset = 0; offset < count; offset += 1) {
+    const candidate = ((index + offset * step) % count + count) % count;
+    if (state.playlist[candidate]?.spotifyUri) return candidate;
+  }
+  return -1;
+}
+
+// Play only plays: it finds songs Spotify doesn't know yet, then hands Spotify the mix's songs.
+// It never creates or changes a playlist; only Save to Spotify does that.
+async function playMixOnSpotify(index = 0) {
+  void state.webPlayer?.activateElement?.();
+  if (state.playlist.some((track) => !track.spotifyUri)) {
+    showToast("Finding these songs on Spotify…");
+    const unmatched = await matchPlaylistTracksToSpotify();
+    if (unmatched.length) {
+      showToast(`${unmatched.length} ${unmatched.length === 1 ? "song isn't" : "songs aren't"} on Spotify and will be skipped.`);
+    }
+  }
+  if (!playableUris().length) throw new Error("None of the songs in this mix could be found on Spotify.");
+  await startSpotifyPlayback(playableIndexFrom(index));
+}
+
+// Spotify only lets apps start playback for Premium accounts.
+function reportPlaybackError(error, prefix = "Couldn't start Spotify playback") {
+  console.error(`${prefix}.`, error);
+  if (error.status === 403) {
+    showToast(state.spotifyPlaylist?.url
+      ? "Spotify only lets apps start music for Premium accounts. Open this mix's Spotify copy and press play there."
+      : "Spotify only lets apps start music for Premium accounts. Use Save to Spotify to keep this mix as a playlist, then play it in Spotify.",
+    state.spotifyPlaylist?.url ? { label: "Open in Spotify", href: state.spotifyPlaylist.url } : null);
+    return;
+  }
+  showToast(`${prefix}: ${error.message}`);
+}
+
+// A saved server sign-in lets a new tab or a reopened phone app reconnect without signing in again.
+async function restoreServerSession() {
+  try {
+    await exchangeSpotifyToken({ grant_type: "refresh_token" });
+  } catch (error) {
+    if (error.code === "reconnect_required") state.spotifyError = error.message;
+    else if (error.status !== 401) console.error("Couldn't restore the saved Spotify sign-in.", error);
+  }
+}
+
+// Side B account: the server records listening in the background and keeps it the same on every device.
+const accountPendingKey = "sideb-account-pending-v1";
+const accountImportKey = "sideb-account-imported-v1";
+let accountRequestSeq = 0;
+let accountFlushBusy = false;
+let lastAccountSyncAt = 0;
+
+function hasServerAccount() {
+  return Boolean(state.spotifyUser && readSpotifySession()?.server_session);
+}
+
+function accountTrack({ id, title, artist, album, duration, spotifyUri, spotifyUrl, type }) {
+  return { id, title, artist, album, duration, spotifyUri, spotifyUrl, type };
+}
+
+async function accountRequest(path, { method = "GET", body } = {}) {
+  const response = await fetch(path, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : {},
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(20_000)
+  });
+  if (response.status === 204) return null;
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(payload?.error || `Side B server request failed (${response.status}).`);
+  return payload;
+}
+
+function applyAccountListening(listening) {
+  if (!listening) return;
+  state.heard = listening.heard;
+  state.discoveries = listening.discoveries.map((track, index) => ({ ...track, color: track.color || getTrackColor(index) }));
+  if (Array.isArray(listening.liked)) {
+    state.likedTracks = Object.fromEntries(listening.liked.map((track, index) => [track.id, { ...track, color: track.color || getTrackColor(index) }]));
+    state.liked = listening.liked.map((track) => track.id).reverse();
+    writeStorage(storageKeys.likedTracks, state.likedTracks);
+    writeStorage(storageKeys.likes, state.liked);
+  }
+  state.held = Object.fromEntries(Object.entries(listening.held).map(([trackId, entry], index) => [
+    trackId,
+    { ...entry, track: { ...entry.track, color: entry.track.color || getTrackColor(index) } }
+  ]));
+  writeStorage(storageKeys.heard, state.heard);
+  writeStorage(storageKeys.discoveries, state.discoveries);
+  writeStorage(storageKeys.held, state.held);
+  updateCounts();
+  renderPlaylist();
+  if (state.currentView !== "mix") renderCollection();
+}
+
+// Events wait in browser storage until the server confirms them, so listening in a dead zone isn't lost.
+function reportListening(event) {
+  if (!hasServerAccount()) return;
+  writeStorage(accountPendingKey, [...readStorage(accountPendingKey, []), event].slice(-200));
+  void flushAccountEvents();
+}
+
+async function flushAccountEvents() {
+  if (accountFlushBusy || !hasServerAccount()) return;
+  accountFlushBusy = true;
+  let failed = false;
+  try {
+    let pending = readStorage(accountPendingKey, []);
+    while (pending.length) {
+      const batch = pending.slice(0, 50);
+      const seq = ++accountRequestSeq;
+      const { listening } = await accountRequest("/api/listening/events", { method: "POST", body: { events: batch } });
+      pending = readStorage(accountPendingKey, []).slice(batch.length);
+      writeStorage(accountPendingKey, pending);
+      // Only the newest response reflects every confirmed change.
+      if (!pending.length && seq === accountRequestSeq) applyAccountListening(listening);
+    }
+  } catch (error) {
+    failed = true;
+    console.error("Couldn't save listening to your Side B account; it will retry.", error);
+  } finally {
+    accountFlushBusy = false;
+  }
+  if (!failed && readStorage(accountPendingKey, []).length) void flushAccountEvents();
+}
+
+// The first time a browser connects, its existing local history is added to the account.
+async function importLocalListening() {
+  const flag = `${accountImportKey}-${state.spotifyUser.id}`;
+  // Likes were added to accounts later, so browsers that already imported their history import likes once more.
+  const likedFlag = `${accountImportKey}-liked-${state.spotifyUser.id}`;
+  const importAll = !localStorage.getItem(flag);
+  if (!importAll && localStorage.getItem(likedFlag)) return;
+  const liked = state.liked.map((id) => state.likedTracks[id]).filter(Boolean);
+  await accountRequest("/api/listening/import", {
+    method: "POST",
+    body: importAll ? { heard: state.heard, discoveries: state.discoveries, held: state.held, liked } : { liked }
+  });
+  const now = new Date().toISOString();
+  localStorage.setItem(flag, localStorage.getItem(flag) || now);
+  localStorage.setItem(likedFlag, now);
+}
+
+function announceRecorded(recorded) {
+  if (!recorded) return;
+  const parts = [];
+  if (recorded.discoveries) parts.push(`${recorded.discoveries} new ${recorded.discoveries === 1 ? "discovery" : "discoveries"}`);
+  if (recorded.skipped) parts.push(`${recorded.skipped} ${recorded.skipped === 1 ? "skip" : "skips"} held back`);
+  if (parts.length) showToast(`While you were away: ${parts.join(" · ")}.`);
+}
+
+// Saved mixes are kept on the server too, so they're the same on every device. The newest copy wins.
+function writeSavedMixes(nextSaved) {
+  if (!writeStorage(storageKeys.saved, nextSaved)) return false;
+  state.saved = nextSaved;
+  markSavedMixesChanged();
+  return true;
+}
+
+let savedUploadTimer = null;
+function markSavedMixesChanged() {
+  writeStorage(storageKeys.savedUpdatedAt, Date.now());
+  if (!hasServerAccount()) return;
+  window.clearTimeout(savedUploadTimer);
+  savedUploadTimer = window.setTimeout(() => void uploadSavedMixes(), 800);
+}
+
+async function uploadSavedMixes() {
+  try {
+    await accountRequest("/api/saved-mixes", {
+      method: "PUT",
+      body: { mixes: state.saved, updatedAt: readStorage(storageKeys.savedUpdatedAt, 0) || Date.now() }
+    });
+  } catch (error) {
+    console.error("Couldn't save your mixes to your Side B account.", error);
+  }
+}
+
+async function syncSavedMixes() {
+  const server = await accountRequest("/api/saved-mixes");
+  const localUpdatedAt = readStorage(storageKeys.savedUpdatedAt, 0);
+  if (server.mixes && server.updatedAt > localUpdatedAt) {
+    state.saved = server.mixes;
+    writeStorage(storageKeys.saved, state.saved);
+    writeStorage(storageKeys.savedUpdatedAt, server.updatedAt);
+    if (state.currentView === "saved") renderCollection();
+  } else if (localUpdatedAt > server.updatedAt || (!server.mixes && state.saved.length)) {
+    await uploadSavedMixes();
+  }
+}
+
+async function syncAccountListening() {
+  if (!hasServerAccount() || Date.now() - lastAccountSyncAt < 60_000) return;
+  lastAccountSyncAt = Date.now();
+  try {
+    await importLocalListening();
+    await flushAccountEvents();
+    await syncSavedMixes().catch((error) => console.error("Couldn't sync saved mixes.", error));
+    const seq = ++accountRequestSeq;
+    const result = await accountRequest("/api/listening/sync", { method: "POST" });
+    if (seq === accountRequestSeq && !readStorage(accountPendingKey, []).length) applyAccountListening(result.listening);
+    announceRecorded(result.recorded);
+  } catch (error) {
+    console.error("Couldn't sync listening with your Side B account.", error);
+  }
+}
+
+// Play log: the last 30 days of Spotify plays. It lets "Today" and "This week" look further back than the
+// 50 plays Spotify returns, and catches up listening done while Side B was closed when the server isn't
+// recording it.
+const playLogKey = "sideb-play-log-v1";
+const appListenKey = "sideb-app-listens-v1";
+const dayMs = 24 * 60 * 60 * 1000;
+let catchUpBusy = false;
+let lastCatchUpAt = 0;
+
+// Remembers what Side B's own player counted, so the same play isn't counted again from history.
+function rememberAppListen(track) {
+  const recent = readStorage(appListenKey, []).filter((listen) => listen.at > Date.now() - 2 * dayMs);
+  writeStorage(appListenKey, [...recent, { trackId: track.id, at: Date.now() }].slice(-300));
+}
+
+function addKnownTracks(trackIds) {
+  const nextHeard = [...new Set([...state.heard, ...trackIds])];
+  if (nextHeard.length !== state.heard.length && writeStorage(storageKeys.heard, nextHeard)) state.heard = nextHeard;
+}
+
+function judgePlays(plays) {
+  const recorded = { discoveries: 0, skipped: 0 };
+  const appListens = readStorage(appListenKey, []);
+  const favoriteIds = new Set(state.spotifyTopTracks.map((track) => track.id));
+  const mode = listeningRules.detectTimestampMode(plays);
+  for (const { play, outcome, listenedRatio } of listeningRules.classifyPlays(plays, mode)) {
+    play.outcome = outcome;
+    if (outcome === "unknown") continue;
+    const windowMs = play.track.duration * 1000 + 5 * 60 * 1000;
+    if (appListens.some((listen) => listen.trackId === play.track.id && Math.abs(listen.at - play.playedAt) <= windowMs)) {
+      play.outcome = "app";
+      continue;
+    }
+    const track = { ...play.track, color: getTrackColor(recorded.discoveries + recorded.skipped) };
+    if (outcome === "heard") {
+      const isNew = !state.heard.includes(track.id) && !favoriteIds.has(track.id) && !sameSongIn(state.discoveries, track);
+      markTrackHeard(track);
+      if (isNew) {
+        saveDiscovery({ ...track, type: "discovery" });
+        recorded.discoveries += 1;
+      }
+    } else if (applyHold(track, listenedRatio)) {
+      recorded.skipped += 1;
+    }
+  }
+  return recorded;
+}
+
+async function catchUpPlayHistory() {
+  if (!state.spotifyUser || catchUpBusy) return;
+  catchUpBusy = true;
+  lastCatchUpAt = Date.now();
+  try {
+    const log = readStorage(playLogKey, []);
+    const params = new URLSearchParams({ limit: "50" });
+    const newest = log.reduce((latest, play) => Math.max(latest, play.playedAt), 0);
+    if (newest) params.set("after", String(newest));
+    const history = await spotifyRequest(`/me/player/recently-played?${params.toString()}`);
+    const firstRun = !log.length;
+    // With a server account the server judges plays itself; then this log only feeds Today and This week.
+    const judgeHere = !hasServerAccount() && !firstRun;
+    const seen = new Set(log.map((play) => play.playedAt));
+    const fresh = (history.items || [])
+      .filter((item) => item.track?.type === "track" && !item.track.is_local)
+      .map((item) => ({
+        playedAt: Date.parse(item.played_at),
+        track: accountTrack(fromSpotifyTrack(item.track, 0, "discovery")),
+        outcome: judgeHere ? null : "not-judged"
+      }))
+      .filter((play) => Number.isFinite(play.playedAt) && !seen.has(play.playedAt));
+    const plays = [...log, ...fresh]
+      .filter((play) => play.playedAt >= Date.now() - 30 * dayMs)
+      .sort((first, second) => first.playedAt - second.playedAt)
+      .slice(-1000);
+    // The first time, everything already played counts as known, so old favorites don't become discoveries.
+    if (firstRun) addKnownTracks([...fresh.map((play) => play.track.id), ...state.spotifyTopTracks.map((track) => track.id)]);
+    if (judgeHere) announceRecorded(judgePlays(plays));
+    writeStorage(playLogKey, plays);
+  } catch (error) {
+    console.error("Couldn't catch up on Spotify listening.", error);
+  } finally {
+    catchUpBusy = false;
+  }
+}
+
+// Plays since a time, from this browser's log plus the server's fuller log when there is one.
+async function loggedPlaysSince(since) {
+  const plays = new Map(readStorage(playLogKey, []).filter((play) => play.playedAt >= since).map((play) => [play.playedAt, play]));
+  if (hasServerAccount()) {
+    try {
+      const result = await accountRequest(`/api/listening/plays?since=${since}`);
+      result.plays.forEach((play) => plays.set(play.playedAt, play));
+    } catch (error) {
+      console.error("Couldn't load the server's play log.", error);
+    }
+  }
+  return [...plays.values()];
+}
+
+// The play log stores Side B's track shape; mix building works with Spotify's.
+function toSpotifyShape(track) {
+  return {
+    type: "track",
+    id: track.id,
+    uri: track.spotifyUri,
+    name: track.title,
+    artists: track.artist.split(", ").map((name) => ({ name })),
+    album: { name: track.album },
+    duration_ms: track.duration * 1000,
+    external_urls: { spotify: track.spotifyUrl }
+  };
 }
 
 async function handleSpotifyCallback() {
@@ -444,9 +819,7 @@ function updateSpotifyUi() {
     ? "Spotify connected"
     : state.spotifyConnecting ? "Connecting…"
       : state.spotifyError ? "Reconnect Spotify" : "Connect Spotify";
-  $("#save-button").querySelector("span").textContent = state.currentSavedMixId
-    ? state.spotifyPlaylist && connected ? "Update Spotify" : "Update saved mix"
-    : connected ? "Export to Spotify" : "Save mix";
+  $("#save-button").querySelector("span").textContent = saveButtonLabel();
   $("#save-local-button").classList.toggle("hidden", !connected);
   $("#save-local-button").textContent = state.currentSavedMixId ? "Update in Side B" : "Save in Side B";
   $("#data-source-label").textContent = connected ? "SPOTIFY TRACKS · SPOTIFY DEVICE PLAYBACK" : "SAMPLE TRACKS · PLAYBACK SIMULATED";
@@ -464,10 +837,13 @@ function openSpotifyDialog() {
   $("#client-id-input").value = spotifyClientId();
   $("#redirect-uri").textContent = redirectUri();
   $("#dialog-description").textContent = state.spotifyUser
-    ? `Connected as ${state.spotifyUser.display_name || state.spotifyUser.id}. Reconnect to approve playback and playlist permissions, or disconnect this browser tab.`
+    ? hasServerAccount()
+      ? `Connected as ${state.spotifyUser.display_name || state.spotifyUser.id}. Side B records your Spotify listening in the background, even with this app closed. Disconnect signs out this device; Delete my Side B data stops recording and erases it.`
+      : `Connected as ${state.spotifyUser.display_name || state.spotifyUser.id}. Reconnect to approve playback and playlist permissions, or disconnect this browser tab.`
     : serverConfigured
       ? "Connect your Spotify account. Side B uses its registered Spotify app; your Spotify password and account remain with Spotify."
       : "Create a Spotify developer app, then paste its Client ID here. Sign-in uses Spotify's PKCE flow; this app never asks for your Spotify password or a client secret.";
+  $("#delete-account-button").classList.toggle("hidden", !hasServerAccount());
   $("#dialog-done").textContent = state.spotifyUser ? "Disconnect" : serverConfigured ? "Close" : "Save Client ID";
   $("#dialog-connect").textContent = state.spotifyUser ? "Reconnect" : serverConfigured ? "Connect Spotify" : "Save & connect";
   $("#info-dialog").showModal();
@@ -508,10 +884,16 @@ async function loadSpotifyMix() {
     familiarItems = result.items;
   } else {
     const result = await spotifyRequest("/me/player/recently-played?limit=50");
-    const minTimestamp = Date.now() - (state.period === "day" ? 24 : 24 * 7) * 60 * 60 * 1000;
-    const playedTracks = result.items
-      .filter((item) => Date.parse(item.played_at) >= minTimestamp)
-      .map((item) => item.track);
+    const minTimestamp = Date.now() - (state.period === "day" ? 1 : 7) * dayMs;
+    const plays = new Map();
+    result.items.forEach((item) => {
+      const playedAt = Date.parse(item.played_at);
+      if (playedAt >= minTimestamp && item.track?.type === "track" && !item.track.is_local) plays.set(playedAt, item.track);
+    });
+    (await loggedPlaysSince(minTimestamp)).forEach((play) => {
+      if (!plays.has(play.playedAt) && play.track.spotifyUri) plays.set(play.playedAt, toSpotifyShape(play.track));
+    });
+    const playedTracks = [...plays.values()];
     const playCounts = new Map();
     playedTracks.forEach((track) => playCounts.set(track.id, (playCounts.get(track.id) || 0) + 1));
     familiarItems = [...new Map(playedTracks.map((track) => [track.id, track])).values()]
@@ -530,10 +912,22 @@ async function loadSpotifyMix() {
   const genreCounts = new Map();
   artistResult.items.forEach((artist) => artist.genres?.forEach((genre) => genreCounts.set(genre, (genreCounts.get(genre) || 0) + 1)));
   const genres = [...genreCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(([genre]) => genre);
-  const queries = genres.length
-    ? genres.map((genre) => `genre:"${genre}"`)
-    : artistResult.items.slice(0, 4).map((artist) => `artist:"${artist.name}"`);
-  for (const seed of state.seedTracks) {
+  // Spotify no longer gives apps "similar artists", and often no genres either. The artists your
+  // favorites collaborate with (but who aren't favorites themselves) are the best lead to new music.
+  const topArtistNames = new Set(artistResult.items.map((artist) => artist.name.toLowerCase()));
+  const collaborators = new Set();
+  familiarItems.forEach((track) => track.artists.forEach((artist) => {
+    if (!topArtistNames.has(artist.name.toLowerCase())) collaborators.add(artist.name);
+  }));
+  const queries = [
+    ...genres.map((genre) => `genre:"${genre}"`),
+    ...shuffle([...collaborators]).slice(0, 6).map((name) => `artist:"${name}"`)
+  ];
+  if (queries.length < 3) {
+    queries.push(...shuffle(artistResult.items).slice(0, 4 - queries.length).map((artist) => `artist:"${artist.name}"`));
+  }
+  // Picks steer the search for new songs unless this mix doesn't use them.
+  for (const seed of ["keep", "guide"].includes(state.seedMode) ? state.seedTracks : []) {
     const seedArtist = seed.artist.split(",")[0].trim();
     if (seedArtist && !queries.some((query) => query.toLowerCase().includes(seedArtist.toLowerCase()))) {
       queries.unshift(`artist:"${seedArtist}"`);
@@ -541,27 +935,49 @@ async function loadSpotifyMix() {
   }
   const searchResults = await Promise.all(queries.map(async (query) => {
     const params = new URLSearchParams({ q: query, type: "track", limit: "10" });
+    // Genre searches go deeper at random, so the same top results don't come back every time.
+    if (query.startsWith("genre:")) params.set("offset", String(10 * Math.floor(Math.random() * 4)));
     if (state.spotifyUser.country) params.set("market", state.spotifyUser.country);
     const response = await spotifyRequest(`/search?${params.toString()}`);
     return response.tracks.items;
   }));
-  const uniqueDiscoveries = new Map();
-  searchResults.flat().forEach((track) => {
-    if (!familiarIds.has(track.id) && !track.is_local) uniqueDiscoveries.set(track.id, track);
+  // "New for you" means a song you haven't heard: not a favorite, not heard before, and not another
+  // release of either. At most two per artist keeps one artist from filling the mix.
+  const knownIds = new Set([...familiarIds, ...state.heard]);
+  const knownSongs = new Set(familiarTracks.map(songKey));
+  const songsPerArtist = new Map();
+  const newTracks = [];
+  shuffle(searchResults.flat()).forEach((track) => {
+    if (track.is_local || knownIds.has(track.id)) return;
+    const candidate = fromSpotifyTrack(track, newTracks.length + 1, "discovery");
+    const key = songKey(candidate);
+    const leadArtist = track.artists[0]?.name.toLowerCase() || "";
+    if (knownSongs.has(key) || (songsPerArtist.get(leadArtist) || 0) >= 2) return;
+    knownSongs.add(key);
+    songsPerArtist.set(leadArtist, (songsPerArtist.get(leadArtist) || 0) + 1);
+    newTracks.push(candidate);
   });
-  const newTracks = [...uniqueDiscoveries.values()].map((track, index) => fromSpotifyTrack(track, index + 1, "discovery"));
   return { familiarTracks, newTracks };
 }
 
 function composeMix(favorites, discoveries) {
-  const seedIds = new Set(state.seedTracks.map((track) => track.id));
+  // Liked songs come up more often: they get a head start in the shuffle of familiar songs.
+  const likedIds = new Set(state.liked);
+  const usePicks = state.seedMode !== "off";
+  const seedIds = new Set(usePicks ? state.seedTracks.map((track) => track.id) : []);
   const eligible = (track) => !isTrackUnavailable(track);
-  const availableSeeds = state.seedTracks.filter(eligible);
+  const availableSeeds = usePicks ? state.seedTracks.filter(eligible) : [];
+  const favoriteKeys = new Set(favorites.map(songKey));
   const pools = {
     familiar: shuffle(favorites.filter((track) => eligible(track) && !seedIds.has(track.id))),
+    // Another release of a song you already play isn't new for you.
     discovery: shuffle(discoveries.filter((track) => eligible(track)
-      && !seedIds.has(track.id) && !favorites.some((favorite) => favorite.id === track.id)))
+      && !seedIds.has(track.id) && !favoriteKeys.has(songKey(track))))
   };
+  pools.familiar = pools.familiar
+    .map((track) => ({ track, weight: Math.random() + (likedIds.has(track.id) ? 0.6 : 0) }))
+    .sort((first, second) => second.weight - first.weight)
+    .map(({ track }) => track);
   const seedArtists = new Set(availableSeeds.map((track) => track.artist.toLowerCase()));
   const favorSeedArtists = (pool) => pool.sort((first, second) => {
     const firstMatch = [...seedArtists].some((artist) => artist && first.artist.toLowerCase().includes(artist));
@@ -572,12 +988,22 @@ function composeMix(favorites, discoveries) {
     favorSeedArtists(pools.familiar);
     favorSeedArtists(pools.discovery);
   }
+  // "Only my picks": the mix is the picks, shuffled, whatever the length setting.
+  if (state.seedMode === "only") {
+    pools.familiar = [];
+    pools.discovery = [];
+  }
   const chosen = [];
+  let ranOut = null;
+  // One version per song, even when Spotify returns the album and single releases separately.
+  const chosenKeys = new Set();
   let totalSeconds = 0;
   let familiarCount = 0;
   const targetSeconds = state.durationMinutes * 60;
-  if (state.seedMode === "keep") {
+  if (state.seedMode === "keep" || state.seedMode === "only") {
     availableSeeds.forEach((track) => {
+      if (chosenKeys.has(songKey(track))) return;
+      chosenKeys.add(songKey(track));
       const type = track.type || (track.familiarity > 0 ? "familiar" : "discovery");
       chosen.push({ ...track, type });
       if (type === "familiar") familiarCount += 1;
@@ -588,11 +1014,15 @@ function composeMix(favorites, discoveries) {
   while ((state.lengthMode === "duration" ? totalSeconds < targetSeconds : chosen.length < state.trackCountTarget)
     && (pools.familiar.length || pools.discovery.length)) {
     const currentFamiliarShare = chosen.length ? familiarCount / chosen.length : 0;
-    const preferredPool = currentFamiliarShare < state.ratio / 100 ? "familiar" : "discovery";
-    const fallbackPool = preferredPool === "familiar" ? "discovery" : "familiar";
-    const selectedPool = pools[preferredPool].length ? preferredPool : fallbackPool;
+    const selectedPool = currentFamiliarShare < state.ratio / 100 ? "familiar" : "discovery";
+    // Keep the chosen balance: when one kind runs out, end the mix rather than fill it with the other.
+    if (!pools[selectedPool].length) {
+      ranOut = selectedPool;
+      break;
+    }
     const track = pools[selectedPool].shift();
-    if (!track) break;
+    if (chosenKeys.has(songKey(track))) continue;
+    chosenKeys.add(songKey(track));
     chosen.push({
       ...track,
       type: track.type || (selectedPool === "familiar" ? "familiar" : "discovery")
@@ -608,11 +1038,13 @@ function composeMix(favorites, discoveries) {
   state.activeIndex = -1;
   state.spotifyPlaylist = null;
   state.currentSavedMixId = null;
-  stopPlayback();
+  state.mixEdited = false;
+  stopMixPlayback();
   renderPlaylist();
   $("#mix-date").textContent = "Just now";
   $("#mix-kicker").textContent = `MADE FOR ${state.period === "day" ? "TODAY" : `YOUR ${state.period.toUpperCase()}`}`;
   $("#playlist-title").textContent = ["The Long Way Home", "Soft Focus FM", "Somewhere New", "Windows Down Radio"][Math.floor(Math.random() * 4)];
+  return { ranOut };
 }
 
 function updateDurationControl() {
@@ -647,10 +1079,37 @@ function updateRatioControl() {
   range.style.background = `linear-gradient(to right, var(--lime) 0 ${percentage}%, #3a3e35 ${percentage}% 100%)`;
 }
 
+// Adds liked songs to the familiar ones a mix is built from (Spotify songs only when connected).
+function withLikedSongs(familiar, spotifyOnly) {
+  const pool = [...familiar];
+  state.liked.map((id) => state.likedTracks[id]).filter(Boolean).forEach((track) => {
+    const uri = spotifyUriOf(track);
+    if ((spotifyOnly && !uri) || sameSongIn(pool, track)) return;
+    pool.push({ ...track, spotifyUri: uri, type: "familiar", familiarity: Math.max(track.familiarity || 0, 70) });
+  });
+  return pool;
+}
+
+// A mix with songs added or removed by hand that isn't saved would be lost when replaced.
+function confirmReplaceMix() {
+  if (!state.mixEdited || state.currentSavedMixId) return true;
+  const replace = window.confirm("Replace this mix? The songs you added or removed haven't been saved.");
+  if (replace) state.mixEdited = false;
+  return replace;
+}
+
 async function buildMix() {
+  if (!confirmReplaceMix()) return;
+  if (state.seedMode === "only") {
+    composeMix([], []);
+    showToast(state.playlist.length
+      ? `Your ${state.playlist.length} picks, shuffled.`
+      : "You haven't picked any songs yet. Use Add songs, then \u201cAdd to my picks\u201d.");
+    return;
+  }
   const button = $("#generate-button");
   if (!state.spotifyUser) {
-    const favorites = tracks.filter((track) => track.familiarity > 0 && track.periods.includes(state.period));
+    const favorites = withLikedSongs(tracks.filter((track) => track.familiarity > 0 && track.periods.includes(state.period)), false);
     const discoveries = tracks.filter((track) => track.familiarity === 0);
     composeMix(favorites, discoveries);
     const actualMinutes = state.playlist.reduce((sum, track) => sum + track.duration, 0) / 60;
@@ -665,14 +1124,19 @@ async function buildMix() {
   button.querySelector("span").textContent = "Finding your tracks…";
   try {
     const data = await loadSpotifyMix();
-    composeMix(data.familiarTracks, data.newTracks);
+    const { ranOut } = composeMix(withLikedSongs(data.familiarTracks, true), data.newTracks);
     if (!state.playlist.length) throw new Error("Spotify didn't return enough tracks for this listening window. Try a longer window.");
     const actualMinutes = state.playlist.reduce((sum, track) => sum + track.duration, 0) / 60;
-    showToast(state.lengthMode === "tracks"
-      ? `Your ${state.playlist.length}-song mix is ready (~${Math.round(actualMinutes)} min).`
-      : actualMinutes < state.durationMinutes
-      ? `Spotify returned about ${Math.floor(actualMinutes)} minutes of unique tracks for this mix.`
-      : `Your ~${state.durationMinutes}-minute mix is ready.`);
+    const newCount = state.playlist.filter((track) => track.type === "discovery").length;
+    const familiarCount = state.playlist.length - newCount;
+    const short = state.lengthMode === "tracks" ? state.playlist.length < state.trackCountTarget : actualMinutes < state.durationMinutes;
+    showToast(short && ranOut
+      ? `Found ${ranOut === "discovery" ? `${newCount} new` : `${familiarCount} familiar`} songs, so this mix is ${state.playlist.length} songs (~${Math.round(actualMinutes)} min) to keep your ${state.ratio}% familiar balance.`
+      : state.lengthMode === "tracks"
+        ? `Your ${state.playlist.length}-song mix is ready (~${Math.round(actualMinutes)} min).`
+        : actualMinutes < state.durationMinutes
+          ? `Spotify returned about ${Math.floor(actualMinutes)} minutes of unique tracks for this mix.`
+          : `Your ~${state.durationMinutes}-minute mix is ready.`);
   } catch (error) {
     showToast(`Couldn't build your Spotify mix: ${error.message}`);
     console.error("Spotify playlist generation failed.", error);
@@ -691,9 +1155,7 @@ function renderPlaylist() {
     : `${state.trackCountTarget} songs target`;
   $("#mix-runtime").textContent = `${Math.round(totalSeconds / 60)} min · ${targetLabel}`;
   $("#save-button").classList.toggle("saved", Boolean(state.spotifyPlaylist));
-  $("#save-button").querySelector("span").textContent = state.currentSavedMixId
-    ? state.spotifyPlaylist ? "Update Spotify" : "Update saved mix"
-    : state.spotifyUser ? "Export to Spotify" : "Save mix";
+  $("#save-button").querySelector("span").textContent = saveButtonLabel();
   $("#save-local-button").classList.toggle("hidden", !state.spotifyUser);
   $("#save-local-button").textContent = state.currentSavedMixId ? "Update in Side B" : "Save in Side B";
   const openSpotifyLink = $("#open-spotify-playlist");
@@ -703,9 +1165,7 @@ function renderPlaylist() {
   } else {
     openSpotifyLink.removeAttribute("href");
   }
-  $("#play-all-button").querySelector("span").textContent = state.spotifyPlaylist
-    ? "Play on Spotify"
-    : "Play mix";
+  $("#play-all-button").querySelector("span").textContent = state.spotifyUser ? "Play on Spotify" : "Play mix";
   updatePlayerHeart();
 }
 
@@ -722,9 +1182,7 @@ function createTrackRow(track, index, collection, collectionType = "") {
   play.className = "row-play";
   play.setAttribute("aria-label", `Play ${track.title}`);
   play.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 12 7-12 7V5Z" fill="currentColor"/></svg>';
-  if (!collection) {
-    play.addEventListener("click", () => playTrack(index));
-  }
+  play.addEventListener("click", () => (collection ? void playSingleSong(track) : playTrack(index)));
 
   const main = document.createElement("div");
   main.className = "track-main";
@@ -778,6 +1236,14 @@ function createTrackRow(track, index, collection, collectionType = "") {
       removeTrackFromMix(index);
     });
     time.append(remove);
+  } else if (collectionType === "discoveries") {
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "track-remove";
+    remove.textContent = "×";
+    remove.setAttribute("aria-label", `Remove ${track.title} from your discoveries`);
+    remove.addEventListener("click", () => removeDiscovery(track));
+    time.append(remove);
   } else if (collectionType === "held") {
     const entry = state.held[track.id];
     const actions = document.createElement("div");
@@ -812,15 +1278,56 @@ function createTrackRow(track, index, collection, collectionType = "") {
 function removeTrackFromMix(index) {
   const [removed] = state.playlist.splice(index, 1);
   if (!removed) return;
+  state.mixEdited = true;
   if (state.activeIndex === index) {
-    stopPlayback();
-    state.activeIndex = -1;
-  } else if (state.activeIndex > index) {
-    state.activeIndex -= 1;
+    // Removing the song that's playing in Spotify moves on to the next one.
+    if (state.remotePlayback && state.playlist.length) {
+      const nextIndex = index % state.playlist.length;
+      void startSpotifyPlayback(nextIndex).catch((error) => {
+        showToast(`Couldn't move on in Spotify: ${error.message}`);
+        console.error("Spotify playback after removing a song failed.", error);
+      });
+    } else {
+      stopMixPlayback();
+      state.activeIndex = -1;
+    }
+  } else {
+    if (state.activeIndex > index) state.activeIndex -= 1;
+    queueSpotifySync();
   }
   renderPlaylist();
   persistEditedSavedMix();
   showToast(`Removed "${removed.title}" from this mix.`);
+}
+
+// Spotify plays its own copy of the song list. After the mix is edited, hand Spotify the new list and
+// carry on from the same song and position. Quick edits in a row are sent together.
+let spotifySyncTimer = null;
+function queueSpotifySync() {
+  if (!state.remotePlayback) return;
+  window.clearTimeout(spotifySyncTimer);
+  spotifySyncTimer = window.setTimeout(() => {
+    spotifySkips = spotifySkips.then(syncSpotifyQueue).catch((error) => {
+      showToast(`Spotify didn't take the edited mix: ${error.message}`);
+      console.error("Spotify queue update failed.", error);
+    });
+  }, 700);
+}
+
+async function syncSpotifyQueue() {
+  const current = state.playlist[state.activeIndex];
+  if (!state.remotePlayback || !current?.spotifyUri) return;
+  const playback = await spotifyRequest("/me/player");
+  if (!playback?.device?.id) return;
+  const sameSong = playback.item?.uri === current.spotifyUri;
+  const isPlaying = Boolean(playback.is_playing);
+  const position = sameSong ? playback.progress_ms : state.elapsed * 1000;
+  await spotifyRequest(`/me/player/play?device_id=${encodeURIComponent(playback.device.id)}`, {
+    method: "PUT",
+    body: JSON.stringify({ uris: playableUris(), offset: { uri: current.spotifyUri }, position_ms: position })
+  });
+  if (!isPlaying) await spotifyRequest("/me/player/pause", { method: "PUT" });
+  expectSpotifyState({ uri: current.spotifyUri, isPlaying });
 }
 
 function persistEditedSavedMix() {
@@ -829,22 +1336,92 @@ function persistEditedSavedMix() {
   if (index < 0) return;
   const nextSaved = [...state.saved];
   nextSaved[index] = { ...nextSaved[index], tracks: state.playlist, title: $("#playlist-title").textContent };
-  if (writeStorage(storageKeys.saved, nextSaved)) state.saved = nextSaved;
+  writeSavedMixes(nextSaved);
+}
+
+// "My picks" are stored under the older "seeds" name, so existing picks carry over.
+function savePicks(nextPicks) {
+  if (!writeStorage(storageKeys.seeds, nextPicks)) return false;
+  state.seedTracks = nextPicks;
+  updatePicksButton();
+  if ($("#picks-dialog").open) renderPicks();
+  return true;
+}
+
+function updatePicksButton() {
+  $("#picks-button").textContent = `See all (${state.seedTracks.length})`;
 }
 
 function rememberSeed(track) {
   if (state.held[track.id]?.blocked) {
-    showToast(`"${track.title}" is blocked. Allow it from Held back before using it as a seed.`);
+    showToast(`"${track.title}" is blocked. Allow it from Held back before picking it.`);
     return;
   }
-  if (state.seedTracks.some((seed) => seed.id === track.id)) {
-    showToast(`"${track.title}" is already a seed song.`);
+  if (sameSongIn(state.seedTracks, track)) {
+    showToast(`"${track.title}" is already in your picks.`);
     return;
   }
-  const nextSeeds = [...state.seedTracks, track];
-  if (!writeStorage(storageKeys.seeds, nextSeeds)) return;
-  state.seedTracks = nextSeeds;
-  showToast(`"${track.title}" will guide your next mix.`);
+  if (savePicks([...state.seedTracks, track])) showToast(`"${track.title}" added to your picks.`);
+}
+
+function removePick(track) {
+  if (savePicks(state.seedTracks.filter((pick) => pick.id !== track.id))) showToast(`"${track.title}" removed from your picks.`);
+}
+
+function renderPicks() {
+  const list = $("#picks-list");
+  list.replaceChildren();
+  $("#picks-clear").disabled = !state.seedTracks.length;
+  if (!state.seedTracks.length) {
+    const empty = document.createElement("p");
+    empty.className = "search-empty";
+    empty.textContent = "No picks yet. Use Add songs, then \u201cAdd to my picks\u201d.";
+    list.append(empty);
+    return;
+  }
+  state.seedTracks.forEach((track) => {
+    const row = document.createElement("div");
+    row.className = "search-result";
+    const copy = document.createElement("span");
+    copy.className = "saved-mix-copy";
+    const title = document.createElement("strong");
+    title.textContent = track.title;
+    const artist = document.createElement("small");
+    artist.textContent = `${track.artist} \u00b7 ${formatTime(track.duration)}${track.spotifyUri || !state.spotifyUser ? "" : " \u00b7 not on Spotify"}`;
+    copy.append(title, artist);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "text-button";
+    remove.textContent = "Remove";
+    remove.setAttribute("aria-label", `Remove ${track.title} from your picks`);
+    remove.addEventListener("click", () => removePick(track));
+    row.append(copy, remove);
+    list.append(row);
+  });
+}
+
+// Sample-catalog songs picked before connecting Spotify: use the real song where Spotify has it, drop the rest.
+async function cleanUpPicks() {
+  if (!state.seedTracks.some((pick) => !pick.spotifyUri)) return;
+  const nextPicks = [];
+  let removed = 0;
+  for (const pick of state.seedTracks) {
+    if (pick.spotifyUri) {
+      nextPicks.push(pick);
+      continue;
+    }
+    const match = await findSpotifyTrack(pick).catch(() => null);
+    if (!match) {
+      removed += 1;
+      continue;
+    }
+    const real = fromSpotifyTrack(match, nextPicks.length, pick.type === "familiar" ? "familiar" : "discovery");
+    if (!sameSongIn(nextPicks, real)) nextPicks.push(real);
+  }
+  savePicks(nextPicks);
+  if (removed) {
+    showToast(`Removed ${removed} sample ${removed === 1 ? "song" : "songs"} from your picks; Spotify doesn't have ${removed === 1 ? "it" : "them"}.`);
+  }
 }
 
 function addTrackToMix(track) {
@@ -852,13 +1429,18 @@ function addTrackToMix(track) {
     showToast(`"${track.title}" is blocked. Allow it from Held back before adding it.`);
     return false;
   }
-  if (state.playlist.some((existing) => existing.id === track.id)) {
-    showToast(`"${track.title}" is already in this mix.`);
+  const existing = sameSongIn(state.playlist, track);
+  if (existing) {
+    showToast(existing.id === track.id
+      ? `"${track.title}" is already in this mix.`
+      : `"${existing.title}" is already in this mix (another release of the same song).`);
     return false;
   }
   state.playlist = [...state.playlist, track];
+  state.mixEdited = true;
   renderPlaylist();
   persistEditedSavedMix();
+  queueSpotifySync();
   showToast(`Added "${track.title}" to this mix.`);
   return true;
 }
@@ -893,27 +1475,22 @@ function renderSearchResults(results) {
       add.disabled = true;
     };
     add.textContent = "Add to mix";
-    if (state.playlist.some((existing) => existing.id === track.id)) markInMix();
+    if (sameSongIn(state.playlist, track)) markInMix();
     add.addEventListener("click", () => {
       if (addTrackToMix(track)) markInMix();
     });
     const seed = document.createElement("button");
     seed.type = "button";
     seed.className = "text-button";
-    const alreadySeeded = state.seedTracks.some((candidate) => candidate.id === track.id);
-    seed.textContent = alreadySeeded ? "Remove seed" : "Use as seed";
+    const setPickLabel = () => {
+      seed.textContent = sameSongIn(state.seedTracks, track) ? "Remove from picks" : "Add to my picks";
+    };
+    setPickLabel();
     seed.addEventListener("click", () => {
-      if (alreadySeeded) {
-        const nextSeeds = state.seedTracks.filter((candidate) => candidate.id !== track.id);
-        if (writeStorage(storageKeys.seeds, nextSeeds)) {
-          state.seedTracks = nextSeeds;
-          showToast(`"${track.title}" removed from your seed songs.`);
-          void searchSongs($("#track-search-input").value);
-        }
-      } else {
-        rememberSeed(track);
-        void searchSongs($("#track-search-input").value);
-      }
+      const existing = sameSongIn(state.seedTracks, track);
+      if (existing) removePick(existing);
+      else rememberSeed(track);
+      setPickLabel();
     });
     actions.append(add, seed);
     row.append(copy, actions);
@@ -1056,20 +1633,33 @@ function loadImportedPlaylist(title, rawTracks) {
   if (!Array.isArray(rawTracks) || !rawTracks.length || rawTracks.length > 500) {
     throw new Error("The file must contain between 1 and 500 playlist tracks.");
   }
+  if (!confirmReplaceMix()) {
+    showToast("Import cancelled. Your current mix was kept.");
+    return false;
+  }
   const importedTracks = rawTracks.map(normalizeImportedTrack);
   const invalidCount = importedTracks.filter((track) => !track).length;
-  state.playlist = importedTracks.filter(Boolean);
+  // Keep one version of each song, as in generated mixes.
+  const unique = [];
+  importedTracks.filter(Boolean).forEach((track) => {
+    if (!sameSongIn(unique, track)) unique.push(track);
+  });
+  const repeatCount = importedTracks.filter(Boolean).length - unique.length;
+  state.playlist = unique;
   if (!state.playlist.length) throw new Error("No valid tracks were found in that playlist.");
   state.currentSavedMixId = null;
   state.spotifyPlaylist = null;
   state.activeIndex = -1;
-  stopPlayback();
+  state.mixEdited = false;
+  stopMixPlayback();
   renderPlaylist();
   $("#playlist-title").textContent = title || "Imported playlist";
   setView("mix");
-  showToast(invalidCount
-    ? `Imported ${state.playlist.length} songs; skipped ${invalidCount} invalid entries.`
-    : `Imported ${state.playlist.length} songs.`);
+  const notes = [
+    invalidCount ? `skipped ${invalidCount} invalid ${invalidCount === 1 ? "entry" : "entries"}` : "",
+    repeatCount ? `removed ${repeatCount} ${repeatCount === 1 ? "repeat" : "repeats"}` : ""
+  ].filter(Boolean);
+  showToast(`Imported ${state.playlist.length} songs${notes.length ? `; ${notes.join(" and ")}` : ""}.`);
 }
 
 function showUnmatchedSongs(songs) {
@@ -1085,38 +1675,50 @@ function showUnmatchedSongs(songs) {
   $("#unmatched-dialog").showModal();
 }
 
+// Matches by song, not exact text: "Song - 2011 Remaster" or "Song (feat. X)" by the same main artist
+// counts. Tries a precise search first, then a broader one.
 async function findSpotifyTrack(track) {
-  const query = new URLSearchParams({
-    q: `track:"${track.title.replace(/"/g, "")}" artist:"${track.artist.replace(/"/g, "")}"`,
-    type: "track",
-    limit: "5"
-  });
-  const results = await spotifyRequest(`/search?${query.toString()}`);
-  const artists = track.artist.split(/[,;&]/).map((artist) => artist.trim().toLowerCase()).filter(Boolean);
-  return results.tracks.items.find((candidate) =>
-    candidate.name.trim().toLowerCase() === track.title.trim().toLowerCase()
-    && candidate.artists.some((artist) => artists.includes(artist.name.toLowerCase()))) || null;
+  const wanted = songKey(track);
+  const mainArtist = track.artist.split(/[,;&]/)[0].trim();
+  const plainTitle = track.title.replace(/\s+-\s+.*$/, "").replace(/[([].*?[)\]]/g, "").trim() || track.title;
+  const searches = [
+    `track:"${plainTitle.replace(/"/g, "")}" artist:"${mainArtist.replace(/"/g, "")}"`,
+    `${plainTitle} ${mainArtist}`
+  ];
+  for (const q of searches) {
+    const params = new URLSearchParams({ q, type: "track", limit: "10" });
+    if (state.spotifyUser?.country) params.set("market", state.spotifyUser.country);
+    const results = await spotifyRequest(`/search?${params.toString()}`);
+    const match = results.tracks.items.find((candidate) => !candidate.is_local
+      && songKey({ title: candidate.name, artist: candidate.artists.map((artist) => artist.name).join(", ") }) === wanted);
+    if (match) return match;
+  }
+  return null;
+}
+
+// Runs a task over items a few at a time: faster than one by one, gentler on Spotify than all at once.
+async function mapWithConcurrency(items, limit, task) {
+  const results = new Array(items.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      results[index] = await task(items[index], index);
+    }
+  }));
+  return results;
 }
 
 async function matchPlaylistTracksToSpotify() {
   const unmatched = [];
-  const tracks = [];
-  for (const [index, track] of state.playlist.entries()) {
-    if (track.spotifyUri?.startsWith("spotify:track:")) {
-      tracks.push(track);
-      continue;
-    }
+  const tracks = await mapWithConcurrency(state.playlist, 4, async (track, index) => {
+    if (track.spotifyUri?.startsWith("spotify:track:")) return track;
     const match = await findSpotifyTrack(track);
-    if (match) {
-      tracks.push({
-        ...track,
-        ...fromSpotifyTrack(match, index, track.type === "familiar" ? "familiar" : "discovery")
-      });
-    } else {
-      tracks.push(track);
-      unmatched.push(`${track.title} — ${track.artist}`);
-    }
-  }
+    if (match) return { ...track, ...fromSpotifyTrack(match, index, track.type === "familiar" ? "familiar" : "discovery") };
+    unmatched.push(`${track.title} — ${track.artist}`);
+    return track;
+  });
   state.playlist = tracks;
   renderPlaylist();
   return unmatched;
@@ -1154,9 +1756,11 @@ function parseCsv(text) {
   const headers = rows[0].map((value) => value.replace(/^\uFEFF/, "").trim().toLowerCase());
   const indexOf = (...names) => headers.findIndex((header) => names.includes(header));
   const titleIndex = indexOf("title", "name", "track name", "song");
-  const artistIndex = indexOf("artist", "artist name", "artists");
+  // "Artist Name(s)", "Album Name", "Duration (ms)" and "Track URI" are Exportify's column names.
+  const artistIndex = indexOf("artist", "artist name", "artists", "artist name(s)", "artist names");
   const albumIndex = indexOf("album", "album name");
   const durationIndex = indexOf("duration (seconds)", "duration seconds", "duration", "duration (ms)", "duration_ms");
+  const uriIndex = indexOf("track uri", "spotify uri", "uri", "spotify url", "track url", "url");
   if (titleIndex < 0 || artistIndex < 0) throw new Error("The CSV must include Title/Track Name and Artist columns.");
   return rows.slice(1).slice(0, 500).map((values, index) => {
     const rawDuration = values[durationIndex]?.trim() || "";
@@ -1166,10 +1770,15 @@ function parseCsv(text) {
     const durationSeconds = headers[durationIndex]?.includes("ms") || durationValue > 10_000
       ? durationValue / 1000
       : durationValue;
+    // A Spotify link in the file identifies the song exactly, so it needs no search.
+    const link = values[uriIndex]?.trim() || "";
+    const spotifyId = /(?:spotify:track:|open\.spotify\.com\/(?:intl-[a-z-]+\/)?track\/)([A-Za-z0-9]{22})/.exec(link)?.[1];
     return {
-      id: `csv-${index}-${crypto.randomUUID?.() || Date.now()}`,
+      id: spotifyId || `csv-${index}-${crypto.randomUUID?.() || Date.now()}`,
+      spotifyUri: spotifyId ? `spotify:track:${spotifyId}` : undefined,
+      spotifyUrl: spotifyId ? `https://open.spotify.com/track/${spotifyId}` : undefined,
       title: values[titleIndex]?.trim(),
-      artist: values[artistIndex]?.trim(),
+      artist: values[artistIndex]?.trim().replace(/\s*;\s*/g, ", "),
       album: albumIndex >= 0 ? values[albumIndex]?.trim() : "Unknown album",
       duration: Number.isFinite(durationSeconds) && durationSeconds > 0 ? durationSeconds : 210,
       color: getTrackColor(index),
@@ -1183,26 +1792,25 @@ async function importCsvPlaylist(title, csvText) {
   const parsedTracks = parseCsv(csvText);
   if (!parsedTracks.length) throw new Error("No song rows were found in this CSV.");
   if (!state.spotifyUser) {
-    loadImportedPlaylist(title, parsedTracks);
+    if (loadImportedPlaylist(title, parsedTracks) === false) return;
     showToast("CSV imported. Connect Spotify and search for matched tracks to enable full playback or Spotify saving.");
     return;
   }
-  const matched = [];
   const unmatched = [];
-  for (const track of parsedTracks) {
+  const results = await mapWithConcurrency(parsedTracks, 4, async (track, index) => {
+    if (track.spotifyUri) return { ...track, type: state.heard.includes(track.id) ? "familiar" : "discovery" };
     const match = await findSpotifyTrack(track);
-    if (match) {
-      matched.push(fromSpotifyTrack(match, matched.length, state.heard.includes(match.id) ? "familiar" : "discovery"));
-    } else {
-      unmatched.push(`${track.title} — ${track.artist}`);
-    }
-  }
+    if (match) return fromSpotifyTrack(match, index, state.heard.includes(match.id) ? "familiar" : "discovery");
+    unmatched.push(`${track.title} — ${track.artist}`);
+    return null;
+  });
+  const matched = results.filter(Boolean);
   if (!matched.length) {
     $("#playlist-import-dialog").close();
     showUnmatchedSongs(unmatched);
     throw new Error("No CSV songs matched Spotify tracks. Review the unmatched list and check the title and artist columns.");
   }
-  loadImportedPlaylist(title, matched);
+  if (loadImportedPlaylist(title, matched) === false) return;
   $("#playlist-import-dialog").close();
   if (unmatched.length) showUnmatchedSongs(unmatched);
 }
@@ -1234,7 +1842,7 @@ async function importSpotifyPlaylist(playlist) {
     showUnmatchedSongs(unmatched);
     throw new Error("This Spotify playlist has no transferable tracks.");
   }
-  loadImportedPlaylist(playlist.name, tracksFromSpotify);
+  if (loadImportedPlaylist(playlist.name, tracksFromSpotify) === false) return;
   $("#playlist-import-dialog").close();
   if (total > offset) unmatched.push(`${total - offset} additional playlist tracks were not fetched (import limit: 500).`);
   showUnmatchedSongs(unmatched);
@@ -1299,6 +1907,12 @@ function toggleLike(track) {
   const nextLikes = wasLiked ? state.liked.filter((id) => id !== track.id) : [...state.liked, track.id];
   if (!writeStorage(storageKeys.likes, nextLikes)) return;
   state.liked = nextLikes;
+  const nextLikedTracks = { ...state.likedTracks };
+  if (wasLiked) delete nextLikedTracks[track.id];
+  else nextLikedTracks[track.id] = { ...accountTrack(track), spotifyUri: spotifyUriOf(track), color: track.color, likedAt: new Date().toISOString() };
+  if (writeStorage(storageKeys.likedTracks, nextLikedTracks)) state.likedTracks = nextLikedTracks;
+  reportListening({ type: "like", track: accountTrack({ ...track, spotifyUri: spotifyUriOf(track) }), liked: !wasLiked });
+  updateCounts();
   renderPlaylist();
   if (state.currentView !== "mix") renderCollection();
   showToast(state.liked.includes(track.id) ? "Added to your likes." : "Removed from your likes.");
@@ -1317,12 +1931,9 @@ function playTrack(index) {
   $("#duration-time").textContent = formatTime(track.duration);
   $("#current-time").textContent = "0:00";
   $("#progress-fill").style.width = "0%";
-  if (track.spotifyUri) {
+  if (state.spotifyUser) {
     renderPlaylist();
-    void startSpotifyPlayback(index).catch((error) => {
-      showToast(`Couldn't start Spotify playback: ${error.message}`);
-      console.error("Spotify playback could not start.", error);
-    });
+    void playMixOnSpotify(index).catch((error) => reportPlaybackError(error));
     return;
   }
   $("#player-play-button").setAttribute("aria-label", "Pause");
@@ -1344,10 +1955,52 @@ function advancePlayback() {
   }
 }
 
+// Spotify track ids are 22 characters; older saved songs may have only the id.
+function spotifyUriOf(track) {
+  if (track?.spotifyUri) return track.spotifyUri;
+  return /^[A-Za-z0-9]{22}$/.test(track?.id || "") ? `spotify:track:${track.id}` : undefined;
+}
+
+// The Play buttons in Discoveries, Liked and Held back play just that song in Spotify.
+async function playSingleSong(track) {
+  if (!state.spotifyUser) {
+    showToast("Connect Spotify to play this song.");
+    return;
+  }
+  const uri = spotifyUriOf(track);
+  if (!uri) {
+    showToast(`"${track.title}" isn't on Spotify.`);
+    return;
+  }
+  void state.webPlayer?.activateElement?.();
+  try {
+    const deviceId = await findSpotifyPlaybackDevice();
+    if (!deviceId) {
+      showToast("Open the Spotify app first, then press play again.", { label: "Open Spotify", href: "spotify:" });
+      return;
+    }
+    stopPlayback();
+    state.activeIndex = -1;
+    renderPlaylist();
+    await spotifyRequest(`/me/player/play?device_id=${encodeURIComponent(deviceId)}`, {
+      method: "PUT",
+      body: JSON.stringify({ uris: [uri] })
+    });
+    $("#player-track").textContent = track.title;
+    $("#player-artist").textContent = track.artist;
+    $("#player-cover").style.background = track.color || getTrackColor(0);
+    showToast(`Playing "${track.title}" in Spotify.`);
+  } catch (error) {
+    reportPlaybackError(error);
+  }
+}
+
 function saveDiscovery(track) {
-  if (state.discoveries.some((savedTrack) => savedTrack.id === track.id)) return;
+  if (sameSongIn(state.discoveries, track)) return;
   const discoveredTrack = {
     id: track.id,
+    spotifyUri: spotifyUriOf(track),
+    spotifyUrl: track.spotifyUrl,
     title: track.title,
     artist: track.artist,
     album: track.album,
@@ -1373,6 +2026,16 @@ function stopPlayback() {
   $("#player-bar").classList.remove("is-playing");
   $("#player-play-button").setAttribute("aria-label", "Play");
   $("#player-play-button").innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 12 7-12 7V5Z" fill="currentColor"/></svg>';
+}
+
+// For when the mix is replaced: without this, Spotify keeps playing the old mix while Side B shows the new one.
+function stopMixPlayback() {
+  if (state.remotePlayback) {
+    void spotifyRequest("/me/player/pause", { method: "PUT" }).catch((error) => {
+      console.error("Couldn't pause Spotify after replacing the mix.", error);
+    });
+  }
+  stopPlayback();
 }
 
 function hasSpotifyScope(scope) {
@@ -1467,9 +2130,18 @@ function promptOpenSpotifyApp(index, playlistUri) {
   clearPendingSpotifyPlay();
   state.pendingSpotifyPlay = { index, playlistUri, expiresAt: Date.now() + 120_000 };
   pendingPlayTimer = window.setInterval(() => void retryPendingSpotifyPlay(), 2000);
-  const appUri = playlistUri || state.playlist[index]?.spotifyUri || "spotify:";
+  const appUri = playlistUri || "spotify:";
+  // Phones open the Spotify app; once it's running, Side B starts the mix there. Browsers only allow
+  // opening an app right after a tap, so the "Open Spotify" button stays as a backup.
+  if (isMobileBrowser) {
+    try {
+      window.location.href = appUri;
+    } catch (error) {
+      console.error("Couldn't open the Spotify app automatically.", error);
+    }
+  }
   const message = isMobileBrowser
-    ? "Spotify isn't running on this phone yet. Open it, then come back. Side B will start your mix."
+    ? "Opening Spotify… Your mix starts as soon as Spotify is ready. If Spotify didn't open, tap Open Spotify."
     : "No Spotify device is online. Open the Spotify app and Side B will start your mix there.";
   showToast(message, { label: "Open Spotify", href: appUri });
 }
@@ -1490,8 +2162,7 @@ async function retryPendingSpotifyPlay() {
     showToast("Your mix is playing in Spotify.");
   } catch (error) {
     clearPendingSpotifyPlay();
-    showToast(`Couldn't start Spotify playback: ${error.message}`);
-    console.error("Pending Spotify playback could not start.", error);
+    reportPlaybackError(error);
   } finally {
     pendingRetryBusy = false;
   }
@@ -1506,22 +2177,24 @@ function startSpotifyWebPlayer() {
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState !== "visible") return;
   void retryPendingSpotifyPlay();
+  void syncAccountListening();
+  if (Date.now() - lastCatchUpAt > 60_000) void catchUpPlayHistory();
   if (state.remotePlayback) {
     void pollSpotifyPlayback().catch((error) => console.error("Spotify progress refresh failed.", error));
   }
 });
 
-async function startSpotifyPlayback(index, playlistUri = null) {
+async function startSpotifyPlayback(index, playlistUri = null, step = 1) {
   if (!state.spotifyUser) throw new Error("Connect Spotify before starting full-track playback.");
   // Must run synchronously inside the click so browsers allow the web player to make sound.
   void state.webPlayer?.activateElement?.();
-  const uris = state.playlist.map((track) => track.spotifyUri);
-  if (!playlistUri && (!uris.length || uris.some((uri) => !uri))) {
-    throw new Error("Every song in this mix needs a Spotify match for full-track playback.");
-  }
+  index = playableIndexFrom(index, step);
+  if (index < 0) throw new Error("None of the songs in this mix could be found on Spotify.");
+  const track = state.playlist[index];
+  const contextUri = playlistUri;
   const deviceId = await findSpotifyPlaybackDevice();
   if (!deviceId) {
-    promptOpenSpotifyApp(index, playlistUri);
+    promptOpenSpotifyApp(index, contextUri);
     return;
   }
   clearPendingSpotifyPlay();
@@ -1529,38 +2202,110 @@ async function startSpotifyPlayback(index, playlistUri = null) {
   state.remoteTimer = null;
   await spotifyRequest(`/me/player/play?device_id=${encodeURIComponent(deviceId)}`, {
     method: "PUT",
-    body: JSON.stringify(playlistUri
-      ? { context_uri: playlistUri }
-      : { uris, offset: { position: index } })
+    body: JSON.stringify(contextUri
+      ? { context_uri: contextUri, offset: { uri: track.spotifyUri } }
+      : { uris: playableUris(), offset: { uri: track.spotifyUri } })
   });
   state.activeIndex = index;
   state.elapsed = 0;
-  state.listenSession = null;
+  // Side B started this song from 0:00, so count from now even if the page is backgrounded before Spotify confirms it.
+  state.listenSession = { trackId: track.id, listened: 0, lastPosition: 0, lastCheckedAt: Date.now() };
   state.remotePlayback = true;
-  state.lastRemoteTrackId = state.playlist[index].id;
-  $("#player-bar").classList.add("is-playing");
-  $("#player-play-button").setAttribute("aria-label", "Pause");
-  $("#player-play-button").innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5h4v14H7zm7 0h4v14h-4z" fill="currentColor"/></svg>';
+  state.lastRemoteTrackId = track.id;
+  expectSpotifyState({ uri: track.spotifyUri, isPlaying: true });
+  showPlayingState(true);
   updateSpotifyUi();
   renderPlaylist();
-  await pollSpotifyPlayback();
-  state.remoteTimer = window.setInterval(() => {
-    void pollSpotifyPlayback().catch((error) => {
-      if (state.remoteTimer) window.clearInterval(state.remoteTimer);
-      state.remoteTimer = null;
-      state.remotePlayback = false;
+  // Playback has started either way; a failed first check shouldn't keep Side B from following it.
+  try {
+    await pollSpotifyPlayback();
+  } catch (error) {
+    console.error("The first Spotify playback check failed; Side B keeps checking.", error);
+  }
+  startFollowingSpotify();
+}
+
+// About 15 seconds of failed checks in a row; a short signal drop on the road shouldn't end tracking.
+const maxFollowFailures = 5;
+let followBusy = false;
+
+function startFollowingSpotify() {
+  if (state.remoteTimer) window.clearInterval(state.remoteTimer);
+  state.followFailures = 0;
+  state.remoteTimer = window.setInterval(() => void followSpotifyTick(), 3000);
+}
+
+async function followSpotifyTick() {
+  if (followBusy || Date.now() < (state.spotifyQuietUntil || 0)) return;
+  followBusy = true;
+  try {
+    await pollSpotifyPlayback();
+    state.followFailures = 0;
+  } catch (error) {
+    console.error("Spotify playback check failed.", error);
+    // A "slow down" from Spotify, or a session that just ended, isn't a connection failure.
+    if (!state.spotifyUser || Date.now() < (state.spotifyQuietUntil || 0)) return;
+    state.followFailures += 1;
+    if (state.followFailures >= maxFollowFailures) {
       stopPlayback();
-      showToast(`Spotify playback tracking stopped: ${error.message}`);
-      console.error("Spotify playback status polling failed.", error);
-    });
-  }, 3000);
+      showToast(`Lost touch with Spotify, so Side B stopped following playback. Press play to pick it up again. (${error.message})`);
+    }
+  } finally {
+    followBusy = false;
+  }
+}
+
+// Two checks in a row (about 6 seconds) before deciding, so a brief gap between songs isn't mistaken for this.
+function noteSpotifyAway(message) {
+  state.spotifyAwayChecks = (state.spotifyAwayChecks || 0) + 1;
+  if (state.spotifyAwayChecks < 2 || !state.remotePlayback) return;
+  state.spotifyAwayChecks = 0;
+  stopPlayback();
+  updateSpotifyUi();
+  showToast(`${message} Side B stopped following it; press play to start the mix again.`);
+}
+
+function showPlayingState(isPlaying) {
+  $("#player-bar").classList.toggle("is-playing", isPlaying);
+  $("#player-play-button").setAttribute("aria-label", isPlaying ? "Pause" : "Play");
+  $("#player-play-button").innerHTML = isPlaying
+    ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5h4v14H7zm7 0h4v14h-4z" fill="currentColor"/></svg>'
+    : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 12 7-12 7V5Z" fill="currentColor"/></svg>';
+}
+
+// Spotify keeps reporting the previous song or play state for a moment after a command. Until it
+// reports what was asked for (or a few seconds pass), ignore those reports so they can't undo the change.
+function expectSpotifyState({ uri, isPlaying }) {
+  state.expectedSpotify = { uri, isPlaying, until: Date.now() + 6000 };
+}
+
+function isStaleSpotifyReport(playback) {
+  const expected = state.expectedSpotify;
+  if (!expected) return false;
+  const matches = (!expected.uri || playback.item?.uri === expected.uri)
+    && (expected.isPlaying === undefined || Boolean(playback.is_playing) === expected.isPlaying);
+  if (matches || Date.now() > expected.until) {
+    state.expectedSpotify = null;
+    return false;
+  }
+  return true;
 }
 
 async function pollSpotifyPlayback() {
   const playback = await spotifyRequest("/me/player");
-  if (!playback?.item) return;
+  if (!playback?.item) {
+    if (!state.expectedSpotify || Date.now() > state.expectedSpotify.until) noteSpotifyAway("Spotify stopped playing.");
+    return;
+  }
+  if (isStaleSpotifyReport(playback)) return;
   const track = state.playlist.find((candidate) => candidate.spotifyUri === playback.item.uri);
-  if (!track) return;
+  if (!track) {
+    noteSpotifyAway(`Spotify is playing "${playback.item.name}", which isn't in this mix.`);
+    return;
+  }
+  state.spotifyAwayChecks = 0;
+  const previousIndex = state.activeIndex;
+  const wasCounted = Boolean(state.listenSession?.counted);
   state.activeIndex = state.playlist.indexOf(track);
   state.lastRemoteTrackId = track.id;
   state.elapsed = Math.floor((playback.progress_ms || 0) / 1000);
@@ -1570,14 +2315,13 @@ async function pollSpotifyPlayback() {
   $("#duration-time").textContent = formatTime(track.duration);
   $("#current-time").textContent = formatTime(state.elapsed);
   $("#progress-fill").style.width = `${Math.min(state.elapsed / track.duration * 100, 100)}%`;
-  $("#player-bar").classList.toggle("is-playing", Boolean(playback.is_playing));
-  $("#player-play-button").setAttribute("aria-label", playback.is_playing ? "Pause" : "Play");
-  $("#player-play-button").innerHTML = playback.is_playing
-    ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5h4v14H7zm7 0h4v14h-4z" fill="currentColor"/></svg>'
-    : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 12 7-12 7V5Z" fill="currentColor"/></svg>';
+  showPlayingState(Boolean(playback.is_playing));
   recordListening(track, state.elapsed, Boolean(playback.is_playing));
-  updateSpotifyUi();
-  renderPlaylist();
+  // Redraw the list only when the song changes or gets counted as heard, not on every check.
+  if (previousIndex !== state.activeIndex || wasCounted !== Boolean(state.listenSession?.counted)) {
+    updateSpotifyUi();
+    renderPlaylist();
+  }
 }
 
 function togglePlayback() {
@@ -1587,16 +2331,8 @@ function togglePlayback() {
   }
   const activeTrack = state.playlist[state.activeIndex];
   if (activeTrack?.spotifyUri) {
-    const action = state.remotePlayback
-      ? $("#player-play-button").getAttribute("aria-label") === "Pause" ? "pause" : "play"
-      : null;
-    const control = action
-      ? spotifyRequest(`/me/player/${action}`, { method: "PUT" })
-      : startSpotifyPlayback(state.activeIndex);
-    void control.then(() => state.remotePlayback ? pollSpotifyPlayback() : undefined).catch((error) => {
-      showToast(`Spotify playback control failed: ${error.message}`);
-      console.error("Spotify playback control failed.", error);
-    });
+    void state.webPlayer?.activateElement?.();
+    void toggleSpotifyPlayback().catch((error) => reportPlaybackError(error, "Spotify playback control failed"));
     return;
   }
   if (state.timer) {
@@ -1613,12 +2349,46 @@ function togglePlayback() {
   }
 }
 
+// Decides from Spotify's real state, not the button, since playback may have been paused elsewhere.
+async function toggleSpotifyPlayback() {
+  const playback = await spotifyRequest("/me/player");
+  if (!state.remotePlayback) {
+    // If Spotify is still on a song from this mix (tracking stopped, or the page reloaded), follow it again
+    // instead of restarting the song.
+    const inMix = playback?.item ? state.playlist.findIndex((track) => track.spotifyUri === playback.item.uri) : -1;
+    if (inMix < 0) {
+      await playMixOnSpotify(state.activeIndex);
+      return;
+    }
+    if (!playback.is_playing) await spotifyRequest("/me/player/play", { method: "PUT" });
+    state.activeIndex = inMix;
+    state.remotePlayback = true;
+    expectSpotifyState({ uri: playback.item.uri, isPlaying: true });
+    showPlayingState(true);
+    updateSpotifyUi();
+    renderPlaylist();
+    startFollowingSpotify();
+    return;
+  }
+  if (!playback?.item) {
+    await playMixOnSpotify(state.activeIndex);
+    return;
+  }
+  const play = !playback.is_playing;
+  await spotifyRequest(`/me/player/${play ? "play" : "pause"}`, { method: "PUT" });
+  expectSpotifyState({ isPlaying: play });
+  showPlayingState(play);
+}
+
+// Skips run one after another, so a quick double press skips two songs instead of the same one twice.
+let spotifySkips = Promise.resolve();
+
 function nextTrack() {
   if (state.playlist.length === 0) return;
   if (state.remotePlayback && state.playlist[state.activeIndex]?.spotifyUri) {
     // Activate while still inside the click; skipSpotifyTrack awaits before starting playback.
     void state.webPlayer?.activateElement?.();
-    void skipSpotifyTrack().catch((error) => {
+    spotifySkips = spotifySkips.then(skipSpotifyTrack).catch((error) => {
       showToast(`Couldn't skip in Spotify: ${error.message}`);
       console.error("Spotify track skip failed.", error);
     });
@@ -1655,19 +2425,26 @@ function previousTrack() {
     $("#current-time").textContent = "0:00";
   } else if (state.playlist.length) {
     if (state.remotePlayback && state.activeIndex >= 0) {
-      const previousIndex = (state.activeIndex - 1 + state.playlist.length) % state.playlist.length;
-      void startSpotifyPlayback(previousIndex).catch((error) => {
-        showToast(`Couldn't play the previous Spotify track: ${error.message}`);
-        console.error("Spotify previous-track control failed.", error);
-      });
+      void state.webPlayer?.activateElement?.();
+      spotifySkips = spotifySkips
+        .then(() => startSpotifyPlayback((state.activeIndex - 1 + state.playlist.length) % state.playlist.length, null, -1))
+        .catch((error) => {
+          showToast(`Couldn't play the previous Spotify track: ${error.message}`);
+          console.error("Spotify previous-track control failed.", error);
+        });
       return;
     }
     playTrack((state.activeIndex - 1 + state.playlist.length) % state.playlist.length);
   }
 }
 
-function saveMixLocally() {
-  if (!state.playlist.length) return;
+function saveButtonLabel() {
+  if (state.spotifyUser) return state.spotifyPlaylist?.id ? "Update Spotify copy" : "Save to Spotify";
+  return state.currentSavedMixId ? "Update saved mix" : "Save mix";
+}
+
+function saveMixLocally({ announce = true } = {}) {
+  if (!state.playlist.length) return false;
   const existingIndex = state.saved.findIndex((mix) => mix.id === state.currentSavedMixId);
   const existing = existingIndex >= 0 ? state.saved[existingIndex] : null;
   const snapshot = {
@@ -1684,140 +2461,71 @@ function saveMixLocally() {
   const nextSaved = [...state.saved];
   if (existingIndex >= 0) nextSaved[existingIndex] = snapshot;
   else nextSaved.unshift(snapshot);
-  if (!writeStorage(storageKeys.saved, nextSaved)) return;
-  state.saved = nextSaved;
+  if (!writeSavedMixes(nextSaved)) return false;
   state.currentSavedMixId = snapshot.id;
   renderPlaylist();
-  showToast(existing ? "Saved mix updated in Side B." : "Mix saved in Side B.");
+  if (announce) showToast(existing ? "Saved mix updated in Side B." : "Mix saved in Side B.");
+  return true;
 }
 
+// Save to Spotify is the only thing that creates or changes a Spotify playlist.
 async function saveMix() {
   if (!state.playlist.length) return;
-  if (state.currentSavedMixId && state.spotifyPlaylist && state.spotifyUser) {
-    const button = $("#save-button");
-    button.disabled = true;
-    button.querySelector("span").textContent = "Matching Spotify tracks…";
-    try {
-      const unmatched = await matchPlaylistTracksToSpotify();
-      const uris = state.playlist.map((track) => track.spotifyUri).filter(Boolean);
-      if (!uris.length) {
-        showUnmatchedSongs(unmatched);
-        throw new Error("No playlist tracks could be matched to Spotify, so the Spotify playlist was not changed.");
-      }
-      button.querySelector("span").textContent = "Updating Spotify…";
-      await spotifyRequest(`/playlists/${encodeURIComponent(state.spotifyPlaylist.id)}`, {
-        method: "PUT",
-        body: JSON.stringify({ name: $("#playlist-title").textContent, public: false })
-      });
-      await spotifyRequest(`/playlists/${encodeURIComponent(state.spotifyPlaylist.id)}/items`, {
-        method: "PUT",
-        body: JSON.stringify({ uris })
-      });
-      const index = state.saved.findIndex((mix) => mix.id === state.currentSavedMixId);
-      if (index >= 0) {
-        const nextSaved = [...state.saved];
-        nextSaved[index] = { ...nextSaved[index], title: $("#playlist-title").textContent, tracks: state.playlist };
-        if (!writeStorage(storageKeys.saved, nextSaved)) throw new Error("Spotify was updated, but Side B could not update its saved copy.");
-        state.saved = nextSaved;
-      }
-      if (unmatched.length) {
-        showToast(`Spotify playlist updated. ${unmatched.length} unmatched ${unmatched.length === 1 ? "song was" : "songs were"} left out.`);
-        showUnmatchedSongs(unmatched);
-      } else {
-        showToast("Saved playlist updated in Spotify and Side B.");
-      }
-    } catch (error) {
-      showToast(`Couldn't update the Spotify playlist: ${error.message}`);
-      console.error("Spotify playlist update failed.", error);
-    } finally {
-      button.disabled = false;
-      renderPlaylist();
-    }
+  if (!state.spotifyUser) {
+    saveMixLocally();
     return;
   }
-  if (state.currentSavedMixId && !state.spotifyUser) {
-    const index = state.saved.findIndex((mix) => mix.id === state.currentSavedMixId);
-    if (index >= 0) {
-      const nextSaved = [...state.saved];
-      nextSaved[index] = { ...nextSaved[index], title: $("#playlist-title").textContent, tracks: state.playlist };
-      if (!writeStorage(storageKeys.saved, nextSaved)) return;
-      state.saved = nextSaved;
-      showToast("Saved playlist updated.");
-      renderPlaylist();
-      return;
+  const button = $("#save-button");
+  const updating = Boolean(state.spotifyPlaylist?.id);
+  button.disabled = true;
+  button.querySelector("span").textContent = "Matching Spotify tracks…";
+  try {
+    const unmatched = await matchPlaylistTracksToSpotify();
+    const uris = playableUris();
+    if (!uris.length) {
+      showUnmatchedSongs(unmatched);
+      throw new Error("None of these songs could be found on Spotify.");
     }
-  }
-  if (state.spotifyUser) {
-    const button = $("#save-button");
-    button.disabled = true;
-    button.querySelector("span").textContent = "Matching Spotify tracks…";
-    try {
-      const unmatched = await matchPlaylistTracksToSpotify();
-      const uris = state.playlist.map((track) => track.spotifyUri).filter(Boolean);
-      if (!uris.length) {
-        showUnmatchedSongs(unmatched);
-        throw new Error("No playlist tracks could be matched to Spotify, so no Spotify playlist was created.");
-      }
-      button.querySelector("span").textContent = "Exporting to Spotify…";
+    button.querySelector("span").textContent = "Saving to Spotify…";
+    const name = $("#playlist-title").textContent;
+    if (updating) {
+      await spotifyRequest(`/playlists/${encodeURIComponent(state.spotifyPlaylist.id)}`, {
+        method: "PUT",
+        body: JSON.stringify({ name, public: false })
+      });
+    } else {
       const playlist = await spotifyRequest("/me/playlists", {
         method: "POST",
         body: JSON.stringify({
-          name: $("#playlist-title").textContent,
+          name,
           description: `A Side B mix for ${periodLabels[state.period].toLowerCase()}, with familiar favorites and new discoveries.`,
           public: false,
           collaborative: false
         })
       });
-      await spotifyRequest(`/playlists/${encodeURIComponent(playlist.id)}/items`, {
-        method: "POST",
-        body: JSON.stringify({ uris })
-      });
-      state.spotifyPlaylist = {
-        id: playlist.id,
-        url: playlist.external_urls.spotify,
-        uri: playlist.uri
-      };
-      const snapshot = {
-        id: playlist.id,
-        title: $("#playlist-title").textContent,
-        period: state.period,
-        durationMinutes: state.durationMinutes,
-        lengthMode: state.lengthMode,
-        trackCountTarget: state.trackCountTarget,
-        createdAt: new Date().toISOString(),
-        tracks: state.playlist,
-        spotifyPlaylist: state.spotifyPlaylist
-      };
-      const nextSaved = [snapshot, ...state.saved];
-      const savedLocally = writeStorage(storageKeys.saved, nextSaved);
-      if (savedLocally) {
-        state.saved = nextSaved;
-        state.currentSavedMixId = snapshot.id;
-      }
-      renderPlaylist();
-      $("#save-button").classList.add("saved");
-      button.querySelector("span").textContent = "Exported to Spotify";
-      if (unmatched.length) {
-        showToast(`Spotify playlist created. ${unmatched.length} unmatched ${unmatched.length === 1 ? "song was" : "songs were"} left out.`);
-        showUnmatchedSongs(unmatched);
-      } else {
-        showToast(savedLocally
-          ? "Playlist exported to Spotify and saved in Side B. Find it in Spotify or Android Auto."
-          : "Playlist exported to Spotify, but Side B couldn't save its local shortcut.");
-      }
-    } catch (error) {
-      button.querySelector("span").textContent = "Export to Spotify";
-      showToast(`Couldn't save the Spotify playlist: ${error.message}`);
-      console.error("Spotify playlist creation failed.", error);
-    } finally {
-      button.disabled = false;
+      state.spotifyPlaylist = { id: playlist.id, url: playlist.external_urls?.spotify, uri: playlist.uri };
     }
-    return;
+    await replacePlaylistItems(state.spotifyPlaylist.id, uris);
+    // The Spotify copy belongs to this saved mix, so saving never adds a second entry to Saved mixes.
+    const savedLocally = saveMixLocally({ announce: false });
+    const done = updating ? "Spotify copy updated" : "Saved to Spotify as its own playlist";
+    if (unmatched.length) {
+      showToast(`${done}. ${unmatched.length} ${unmatched.length === 1 ? "song wasn't" : "songs weren't"} found on Spotify and ${unmatched.length === 1 ? "was" : "were"} left out.`);
+      showUnmatchedSongs(unmatched);
+    } else {
+      showToast(savedLocally ? `${done}, and kept in Saved mixes.` : `${done}, but Side B couldn't keep its own copy.`);
+    }
+  } catch (error) {
+    showToast(`Couldn't save to Spotify: ${error.message}`);
+    console.error("Saving the mix to Spotify failed.", error);
+  } finally {
+    button.disabled = false;
+    renderPlaylist();
   }
-  saveMixLocally();
 }
 
 function updateCounts() {
+  $("#liked-count").textContent = state.liked.length;
   $("#discovery-count").textContent = state.discoveries.length;
   $("#held-count").textContent = activeHeldEntries().length;
 }
@@ -1830,7 +2538,7 @@ function selectPeriod(period) {
     button.setAttribute("aria-pressed", String(selected));
   });
   $("#period-hint").textContent = state.spotifyUser
-    ? period === "month" ? "Spotify top tracks · about 4 weeks" : "Recent plays · limited to the latest 50"
+    ? period === "month" ? "Spotify top tracks · about 4 weeks" : period === "day" ? "Your plays from the last 24 hours" : "Your plays from the last 7 days"
     : period === "day" ? "Today's listening snapshot" : "Your recent favorites";
 }
 
@@ -1839,12 +2547,15 @@ function setView(view) {
   document.querySelectorAll(".nav-item").forEach((item) => item.classList.toggle("active", item.dataset.view === view));
   $("#mix-view").classList.toggle("hidden", view !== "mix");
   $("#collection-view").classList.toggle("hidden", view === "mix");
-  $("#page-label").textContent = view === "mix" ? "YOUR MIX" : view === "discoveries" ? "DISCOVERED" : view === "held" ? "HELD BACK" : "SAVED MIXES";
-  $("#collection-title").textContent = view === "discoveries" ? "Your discoveries." : view === "held" ? "Held back songs." : "Your saved mixes.";
+  $("#page-label").textContent = view === "mix" ? "YOUR MIX" : view === "discoveries" ? "DISCOVERED" : view === "held" ? "HELD BACK"
+    : view === "liked" ? "LIKED" : "SAVED MIXES";
+  $("#collection-title").textContent = view === "discoveries" ? "Your discoveries." : view === "held" ? "Held back songs."
+    : view === "liked" ? "Songs you liked." : "Your saved mixes.";
   $("#collection-description").textContent = view === "discoveries"
     ? "Songs you listened to at least 60% of the way through."
     : view === "held" ? "Songs temporarily held after a skip, or blocked until you allow them again."
-      : "Mixes you've kept for another drive.";
+      : view === "liked" ? "Songs you hearted. Liked songs come up more often in your mixes."
+        : "Mixes you've kept for another drive.";
   renderCollection();
 }
 
@@ -1853,6 +2564,17 @@ function renderCollection() {
   const isDiscovery = state.currentView === "discoveries";
   const isHeld = state.currentView === "held";
   const collectionEmpty = $("#collection-empty");
+  if (state.currentView === "liked") {
+    const likedTracks = [...state.liked].reverse().map((id) => state.likedTracks[id]).filter(Boolean);
+    $("#empty-state-title").textContent = "No liked songs yet.";
+    $("#empty-state-copy").textContent = "Tap the heart on any song. Liked songs come up more often in your mixes.";
+    $("#collection-count").textContent = `${likedTracks.length} ${likedTracks.length === 1 ? "song" : "songs"} liked`;
+    likedTracks.forEach((track, index) => collectionList.append(createTrackRow(track, index, true, "liked")));
+    collectionEmpty.classList.toggle("hidden", likedTracks.length > 0);
+    $("#clear-collection").classList.add("hidden");
+    $("#back-to-mix").classList.remove("hidden");
+    return;
+  }
   if (isHeld) {
     const heldEntries = activeHeldEntries();
     $("#empty-state-title").textContent = "Nothing is held back.";
@@ -1874,7 +2596,7 @@ function renderCollection() {
     $("#collection-count").textContent = `${state.discoveries.length} ${state.discoveries.length === 1 ? "track" : "tracks"} saved`;
     $("#clear-collection").textContent = "Clear history";
     state.discoveries.forEach((track, index) => {
-      collectionList.append(createTrackRow(track, index, true));
+      collectionList.append(createTrackRow(track, index, true, "discoveries"));
     });
     collectionEmpty.classList.toggle("hidden", state.discoveries.length > 0);
     $("#clear-collection").classList.toggle("hidden", state.discoveries.length === 0);
@@ -1907,6 +2629,7 @@ function renderCollection() {
     copy.append(title, meta);
     card.append(cover, copy);
     card.addEventListener("click", () => {
+      if (!confirmReplaceMix()) return;
       selectPeriod(mix.period);
       state.lengthMode = mix.lengthMode || "duration";
       $("#playlist-length-mode").value = state.lengthMode;
@@ -1918,7 +2641,7 @@ function renderCollection() {
       state.spotifyPlaylist = mix.spotifyPlaylist || null;
       state.currentSavedMixId = mix.id;
       state.activeIndex = -1;
-      stopPlayback();
+      stopMixPlayback();
       renderPlaylist();
       $("#playlist-title").textContent = mix.title;
       $("#mix-kicker").textContent = `MADE FOR ${mix.period === "day" ? "TODAY" : `YOUR ${mix.period.toUpperCase()}`}`;
@@ -1944,6 +2667,10 @@ function showToast(message, action = null) {
     const link = document.createElement("a");
     link.className = "toast-action";
     link.href = action.href;
+    if (/^https?:/.test(action.href)) {
+      link.target = "_blank";
+      link.rel = "noreferrer";
+    }
     link.textContent = action.label;
     toast.append(" ", link);
   }
@@ -2041,25 +2768,39 @@ $("#playlist-length-mode").addEventListener("change", (event) => {
 });
 $("#seed-mode").addEventListener("change", (event) => {
   state.seedMode = event.target.value;
+  writeStorage(storageKeys.pickMode, state.seedMode);
 });
+$("#seed-mode").value = state.seedMode;
+$("#picks-button").addEventListener("click", () => {
+  renderPicks();
+  $("#picks-dialog .dialog-status").textContent = "";
+  $("#picks-dialog").showModal();
+});
+$("#picks-clear").addEventListener("click", () => {
+  if (!window.confirm(`Remove all ${state.seedTracks.length} songs from your picks?`)) return;
+  if (savePicks([])) showToast("Your picks were cleared.");
+});
+$("#picks-add").addEventListener("click", () => {
+  $("#picks-dialog").close();
+  openTrackSearch();
+});
+updatePicksButton();
 $("#generate-button").addEventListener("click", buildMix);
 $("#shuffle-button").addEventListener("click", () => {
-  state.playlist = shuffle(state.playlist);
+  // The song that's playing keeps playing; everything after it gets a new order.
+  const current = state.playlist[state.activeIndex];
+  state.playlist = current
+    ? [current, ...shuffle(state.playlist.filter((track) => track !== current))]
+    : shuffle(state.playlist);
+  if (current) state.activeIndex = 0;
   renderPlaylist();
-  showToast("Mix shuffled.");
+  persistEditedSavedMix();
+  queueSpotifySync();
+  showToast(current ? "Mix shuffled. The current song keeps playing." : "Mix shuffled.");
 });
 $("#save-button").addEventListener("click", saveMix);
-$("#save-local-button").addEventListener("click", saveMixLocally);
-$("#play-all-button").addEventListener("click", () => {
-  if (state.spotifyPlaylist?.uri) {
-    void startSpotifyPlayback(0, state.spotifyPlaylist.uri).catch((error) => {
-      showToast(`Couldn't play the saved Spotify playlist: ${error.message}`);
-      console.error("Saved Spotify playlist playback could not start.", error);
-    });
-  } else {
-    playTrack(0);
-  }
-});
+$("#save-local-button").addEventListener("click", () => saveMixLocally());
+$("#play-all-button").addEventListener("click", () => playTrack(0));
 $("#add-songs-button").addEventListener("click", openTrackSearch);
 $("#export-playlist-button").addEventListener("click", exportPlaylistFile);
 $("#export-csv-button").addEventListener("click", exportPlaylistCsv);
@@ -2111,7 +2852,7 @@ $("#playlist-file-input").addEventListener("change", async (event) => {
       if (data.format !== "sideb-playlist" || data.version !== 1 || !data.playlist) {
         throw new Error("This is not a supported Side B playlist file.");
       }
-      loadImportedPlaylist(data.playlist.title, data.playlist.tracks);
+      if (loadImportedPlaylist(data.playlist.title, data.playlist.tracks) === false) return;
     }
     $("#playlist-import-dialog").close();
   } catch (error) {
@@ -2178,16 +2919,48 @@ $("#profile-button").addEventListener("click", () => {
   });
 });
 $("#dialog-close").addEventListener("click", () => $("#info-dialog").close());
+function disconnectSpotify({ serverLogout = true } = {}) {
+  // Ending the server session signs out this device only; background recording continues until data is deleted.
+  if (serverLogout && readSpotifySession()?.server_session) {
+    void accountRequest("/api/logout", { method: "POST" }).catch((error) => console.error("Server sign-out failed.", error));
+  }
+  stopPlayback();
+  sessionStorage.removeItem(spotifyTokenKey);
+  disconnectSpotifyWebPlayer();
+  state.spotifyUser = null;
+  state.spotifyPlaylist = null;
+  state.spotifyTopTracks = [];
+  state.spotifyTopArtists = [];
+  updateSpotifyUi();
+  renderPlaylist();
+}
+
+$("#delete-account-button").addEventListener("click", async () => {
+  if (!window.confirm("Delete your listening history, discoveries, and held songs from Side B and sign out? Background recording stops. This can't be undone.")) return;
+  try {
+    await accountRequest("/api/account", { method: "DELETE" });
+  } catch (error) {
+    showToast(`Couldn't delete your Side B data: ${error.message}`);
+    console.error("Account deletion failed.", error);
+    return;
+  }
+  const userId = state.spotifyUser?.id;
+  [storageKeys.discoveries, storageKeys.held, storageKeys.heard, accountPendingKey, `${accountImportKey}-${userId}`, `${accountImportKey}-liked-${userId}`]
+    .forEach((key) => localStorage.removeItem(key));
+  state.discoveries = [];
+  state.held = {};
+  state.heard = [];
+  disconnectSpotify({ serverLogout: false });
+  updateCounts();
+  $("#info-dialog").close();
+  showToast("Your Side B data was deleted and Spotify was disconnected.");
+});
+
 $("#dialog-done").addEventListener("click", () => {
   if (state.spotifyUser) {
-    sessionStorage.removeItem(spotifyTokenKey);
-    disconnectSpotifyWebPlayer();
-    state.spotifyUser = null;
-    state.spotifyPlaylist = null;
-    state.spotifyTopTracks = [];
-    state.spotifyTopArtists = [];
-    updateSpotifyUi();
-    showToast("Spotify disconnected from this browser tab.");
+    const serverAccount = hasServerAccount();
+    disconnectSpotify();
+    showToast(serverAccount ? "Spotify disconnected on this device." : "Spotify disconnected from this browser tab.");
   } else {
     const clientId = $("#client-id-input").value.trim();
     if (clientId) {
@@ -2242,21 +3015,88 @@ $("#info-dialog").addEventListener("click", (event) => {
 document.querySelectorAll(".nav-item").forEach((item) => item.addEventListener("click", () => setView(item.dataset.view)));
 $("#back-to-mix").addEventListener("click", () => setView("mix"));
 $("#clear-collection").addEventListener("click", () => {
+  const what = state.currentView === "discoveries" ? `all ${state.discoveries.length} discoveries`
+    : state.currentView === "held" ? "the whole Held back list" : `all ${state.saved.length} saved mixes`;
+  if (!window.confirm(`Clear ${what}? This can't be undone.`)) return;
   const storageKey = state.currentView === "discoveries" ? storageKeys.discoveries
     : state.currentView === "held" ? storageKeys.held : storageKeys.saved;
   if (!writeStorage(storageKey, state.currentView === "held" ? {} : [])) return;
   if (state.currentView === "discoveries") {
     state.discoveries = [];
+    reportListening({ type: "clear", list: "discoveries" });
   } else if (state.currentView === "held") {
     state.held = {};
+    reportListening({ type: "clear", list: "held" });
   } else {
     state.saved = [];
+    markSavedMixesChanged();
   }
   updateCounts();
   renderCollection();
   showToast("Collection cleared.");
 });
-$("#queue-button").addEventListener("click", () => showToast(`${state.playlist.length} tracks in this mix.`));
+function renderQueue() {
+  const list = $("#queue-list");
+  list.replaceChildren();
+  const start = state.activeIndex >= 0 ? state.activeIndex + 1 : 0;
+  const upcoming = state.playlist.map((track, index) => ({ track, index })).slice(start);
+  const current = state.playlist[state.activeIndex];
+  $("#queue-summary").textContent = current
+    ? `Now playing "${current.title}". ${upcoming.length ? `${upcoming.length} more ${upcoming.length === 1 ? "song" : "songs"} after it.` : "It's the last song in this mix."}`
+    : `${upcoming.length} ${upcoming.length === 1 ? "song" : "songs"} in this mix.`;
+  upcoming.forEach(({ track, index }) => {
+    const row = document.createElement("div");
+    row.className = "search-result";
+    const copy = document.createElement("span");
+    copy.className = "saved-mix-copy";
+    const title = document.createElement("strong");
+    title.textContent = track.title;
+    const artist = document.createElement("small");
+    artist.textContent = `${track.artist} \u00b7 ${formatTime(track.duration)}`;
+    copy.append(title, artist);
+    const play = document.createElement("button");
+    play.type = "button";
+    play.className = "text-button";
+    play.textContent = "Play now";
+    play.addEventListener("click", () => {
+      $("#queue-dialog").close();
+      playTrack(index);
+    });
+    row.append(copy, play);
+    list.append(row);
+  });
+}
+$("#queue-button").addEventListener("click", () => {
+  renderQueue();
+  $("#queue-dialog").showModal();
+});
+
+// Click the progress bar to jump to that point in the song.
+$("#progress-track").addEventListener("click", (event) => {
+  const track = state.playlist[state.activeIndex];
+  if (!track) return;
+  const bounds = event.currentTarget.getBoundingClientRect();
+  const ratio = Math.min(1, Math.max(0, (event.clientX - bounds.left) / bounds.width));
+  const seconds = Math.floor(ratio * track.duration);
+  if (state.remotePlayback) {
+    void spotifyRequest(`/me/player/seek?position_ms=${seconds * 1000}`, { method: "PUT" })
+      .catch((error) => reportPlaybackError(error, "Couldn't jump in this song"));
+  }
+  state.elapsed = seconds;
+  $("#current-time").textContent = formatTime(seconds);
+  $("#progress-fill").style.width = `${ratio * 100}%`;
+});
+
+let volumeTimer = null;
+$("#volume").addEventListener("input", (event) => {
+  const percent = Number(event.target.value);
+  window.clearTimeout(volumeTimer);
+  volumeTimer = window.setTimeout(() => {
+    if (!state.spotifyUser) return;
+    void spotifyRequest(`/me/player/volume?volume_percent=${percent}`, { method: "PUT" })
+      .catch((error) => reportPlaybackError(error, "Couldn't change the volume (some Spotify devices don't allow it)"));
+  }, 300);
+});
 
 composeMix(
   tracks.filter((track) => track.familiarity > 0 && track.periods.includes(state.period)),
@@ -2286,7 +3126,11 @@ async function initializeSpotify() {
       await SideBMusicPlatforms.loadConfig();
     }
     await handleSpotifyCallback();
-    if (!readSpotifySession()?.access_token) return;
+    if (!readSpotifySession()?.access_token) await restoreServerSession();
+    if (!readSpotifySession()?.access_token) {
+      updateSpotifyUi();
+      return;
+    }
     state.spotifyConnecting = true;
     updateSpotifyUi();
     state.spotifyUser = await spotifyRequest("/me");
@@ -2295,7 +3139,10 @@ async function initializeSpotify() {
     updateSpotifyUi();
     showToast(`Connected to Spotify as ${state.spotifyUser.display_name || state.spotifyUser.id}.`);
     startSpotifyWebPlayer();
+    void syncAccountListening();
     selectPeriod(state.period);
+    await cleanUpPicks().catch((error) => console.error("Couldn't match your picks on Spotify.", error));
+    await catchUpPlayHistory();
     await buildMix();
   } catch (error) {
     state.spotifyConnecting = false;
@@ -2316,6 +3163,9 @@ async function reconnectSpotify() {
     state.spotifyError = null;
     updateSpotifyUi();
     startSpotifyWebPlayer();
+    void syncAccountListening();
+    await cleanUpPicks().catch((error) => console.error("Couldn't match your picks on Spotify.", error));
+    await catchUpPlayHistory();
     await buildMix();
   } finally {
     state.spotifyConnecting = false;

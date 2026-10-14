@@ -119,7 +119,7 @@ input[type="range"]::-moz-range-thumb { width: 9px; height: 9px; border: 2px sol
 .button-arrow { margin-left: auto; font-size: 14px; }
 
 .playlist-section { margin-top: 27px; }
-.playlist-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 15px; }
+.playlist-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 15px; }
 .playlist-title-group { display: flex; align-items: center; gap: 14px; }
 .mix-cover { width: 54px; height: 54px; flex: none; position: relative; overflow: hidden; display: grid; place-items: center; background: linear-gradient(145deg, #b8d57b 0%, #818e57 40%, #c2744f 100%); border-radius: 4px; color: #24271d; font: 700 14px/ .8 "Space Grotesk", sans-serif; letter-spacing: -1px; box-shadow: 0 4px 16px #0005; }
 .mix-cover::before { content: ""; position: absolute; width: 85px; height: 34px; border: 1px solid #f4e4b462; border-radius: 50%; transform: rotate(-34deg); }
@@ -133,7 +133,7 @@ input[type="range"]::-moz-range-thumb { width: 9px; height: 9px; border: 2px sol
 .rename-button { padding: 3px; font-size: 8px; }
 .playlist-meta { display: flex; align-items: center; gap: 7px; margin: 0; color: #898d83; font-size: 9px; }
 .meta-dot { color: #575b52; }
-.playlist-actions { display: flex; align-items: center; gap: 8px; }
+.playlist-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
 .icon-button, .save-button, .play-all-button { height: 33px; border-radius: 5px; }
 .icon-button { width: 34px; display: grid; place-items: center; background: transparent; border: 1px solid #343830; color: #bec1b7; }
 .icon-button:hover, .save-button:hover { border-color: #626957; background: #22251f; }
@@ -227,6 +227,7 @@ input[type="range"]::-moz-range-thumb { width: 9px; height: 9px; border: 2px sol
 .collection-header > p:last-child { margin: 12px 0 0; color: #999d93; font-size: 11px; }
 .collection-tools { display: flex; align-items: center; justify-content: space-between; padding: 12px 9px; border-top: 1px solid #2a2d27; border-bottom: 1px solid #2a2d27; color: #888c82; font-size: 9px; }
 .text-button { border: 0; color: #999d93; background: transparent; font-size: 9px; }
+.account-delete { display: block; margin: 14px auto 0; color: #e9a08a; text-decoration: underline; }
 .text-button:hover { color: var(--orange); }
 .collection-list .track-row { grid-template-columns: 35px minmax(190px, 1.5fr) minmax(100px, .8fr) 58px; }
 .saved-mix-card { width: 100%; display: flex; align-items: center; gap: 12px; padding: 11px 10px; border: 0; border-bottom: 1px solid #252823; background: transparent; text-align: left; }
@@ -293,7 +294,8 @@ input[type="range"]::-moz-range-thumb { width: 9px; height: 9px; border: 2px sol
 @media (max-width: 1100px) {
   :root { --sidebar-width: 210px; }
   .main-content { padding-inline: 30px; }
-  .builder-controls { grid-template-columns: 145px 130px minmax(135px, 1fr) 130px; gap: 12px; }
+  /* Fixed column widths overflowed mid-size windows; let the controls wrap onto a second row instead. */
+  .builder-controls { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
   .hero-art { right: -60px; opacity: .8; }
   .welcome-row > div:first-child { z-index: 1; }
 }
@@ -365,3 +367,9 @@ input[type="range"]::-moz-range-thumb { width: 9px; height: 9px; border: 2px sol
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+.picks-label-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.picks-button { padding: 0; color: var(--lime); }
+.progress-track { cursor: pointer; transition: height .12s; }
+.progress-track:hover { height: 6px; }
+.volume { width: 74px; accent-color: var(--lime); }
+@media (max-width: 570px) { .volume { display: none; } }

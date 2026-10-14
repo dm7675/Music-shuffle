@@ -14,6 +14,7 @@
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="styles.css">
     <script src="music-platforms.js" defer></script>
+    <script src="listening-rules.js" defer></script>
     <script src="app.js" defer></script>
   </head>
   <body>
@@ -37,6 +38,11 @@
             <span>Discovered</span>
             <span class="nav-count" id="discovery-count">0</span>
           </button>
+          <button class="nav-item" data-view="liked" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20s-7-4.4-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 10c0 5.6-7 10-7 10Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+            <span>Liked</span>
+            <span class="nav-count" id="liked-count">0</span>
+          </button>
           <button class="nav-item" data-view="saved" type="button">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.8A1.8 1.8 0 0 1 7.8 3h8.4A1.8 1.8 0 0 1 18 4.8V21l-6-3.7L6 21V4.8Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
             <span>Saved mixes</span>
@@ -52,7 +58,7 @@
           <div class="car-card">
             <div class="car-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 11 1.6-4.2A2.8 2.8 0 0 1 9.2 5h5.6a2.8 2.8 0 0 1 2.6 1.8L19 11m-14 0h14a2 2 0 0 1 2 2v4H3v-4a2 2 0 0 1 2-2Zm1 6v2m12-2v2M6 14h.5m11 0h.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
             <strong>Road-ready</strong>
-            <p>Make a mix before you drive. Pick it up in Spotify on Android Auto.</p>
+            <p>Make a mix before you drive. Play it on Spotify and pick it up on Android Auto.</p>
             <span class="car-note"><span class="status-dot"></span> Android Auto companion</span>
           </div>
           <button class="profile-button" id="profile-button" type="button">
@@ -128,10 +134,12 @@
                 <div class="range-legend"><span>A few new turns</span><span>Surprise me</span></div>
               </div>
               <div class="generate-control">
-                <label class="length-mode-label" for="seed-mode">Manual seed songs</label>
-                <select id="seed-mode" aria-label="How to use manually added seed songs">
-                  <option value="keep">Keep in the next mix</option>
-                  <option value="guide">Use as recommendations only</option>
+                <div class="picks-label-row"><label class="length-mode-label" for="seed-mode">My picks</label><button class="text-button picks-button" id="picks-button" type="button">See all (0)</button></div>
+                <select id="seed-mode" aria-label="How to use the songs you picked in this mix">
+                  <option value="keep">Add my picks to the mix</option>
+                  <option value="only">Only my picks, shuffled</option>
+                  <option value="guide">Find songs like my picks</option>
+                  <option value="off">Don't use my picks this time</option>
                 </select>
                 <button class="generate-button" id="generate-button" type="button">
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10m-6-3 3 3-3 3M20 17H10m6-3-3 3 3 3M14 7l-4 10" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -189,9 +197,9 @@
           <button type="button" class="main-play" id="player-play-button" aria-label="Play"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 12 7-12 7V5Z" fill="currentColor"/></svg></button>
           <button type="button" id="next-button" aria-label="Next track"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 5v14M6 5l11 7-11 7V5Z" fill="currentColor"/></svg></button>
         </div>
-        <div class="progress-row"><span id="current-time">0:00</span><div class="progress-track"><div id="progress-fill"></div></div><span id="duration-time">0:00</span></div>
+        <div class="progress-row"><span id="current-time">0:00</span><div class="progress-track" id="progress-track" title="Click to jump to a point in the song"><div id="progress-fill"></div></div><span id="duration-time">0:00</span></div>
       </div>
-      <div class="player-extra"><span class="demo-playback"><span class="equalizer"><i></i><i></i><i></i></span><span id="playback-status-label">DEMO PLAYBACK</span></span><button id="queue-button" type="button" aria-label="Open queue"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 11h16M4 16h10m3 0 3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div>
+      <div class="player-extra"><span class="demo-playback"><span class="equalizer"><i></i><i></i><i></i></span><span id="playback-status-label">DEMO PLAYBACK</span></span><input class="volume" id="volume" type="range" min="0" max="100" step="5" value="80" aria-label="Volume"><button id="queue-button" type="button" aria-label="Open queue"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 11h16M4 16h10m3 0 3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div>
     </div>
 
     <dialog id="info-dialog" class="info-dialog">
@@ -206,6 +214,7 @@
       <a class="spotify-doc-link" href="https://developer.spotify.com/dashboard" target="_blank" rel="noreferrer">Open Spotify Developer Dashboard ↗</a>
       <div class="dialog-note"><strong>Spotify playback</strong><span>Start playback from Side B to control a Spotify device and track its reported progress. Spotify Premium and an active Spotify playback device may be required. Bluetooth audio is routed by your phone. Playback, playlist access, and permissions depend on Spotify's current account and API rules.</span></div>
       <div class="dialog-buttons"><button class="dialog-done" id="dialog-done" type="button">Save Client ID</button><button class="dialog-connect" id="dialog-connect" type="button">Save &amp; connect</button></div>
+      <button class="text-button account-delete hidden" id="delete-account-button" type="button">Delete my Side B data</button>
     </dialog>
     <dialog id="platforms-dialog" class="info-dialog list-dialog">
       <button class="dialog-close" data-close-dialog="platforms-dialog" type="button" aria-label="Close">×</button>
@@ -226,18 +235,34 @@
     <dialog id="track-search-dialog" class="info-dialog list-dialog">
       <button class="dialog-close" data-close-dialog="track-search-dialog" type="button" aria-label="Close">×</button>
       <p class="eyebrow small-eyebrow">BUILD YOUR MIX</p>
-      <h2>Add songs or seed your next mix</h2>
-      <p>Search the sample catalog or Spotify. Added seed songs can stay in the next mix or guide recommendations only.</p>
+      <h2>Add songs or pick your own</h2>
+      <p>Search the sample catalog or Spotify. “Add to mix” adds a song to this mix; “Add to my picks” keeps it for the mixes you make next.</p>
       <input class="client-id-input" id="track-search-input" type="search" placeholder="Search songs or artists" autocomplete="off">
       <p class="dialog-status" role="status" aria-live="polite"></p>
       <div class="search-result-list" id="search-result-list"></div>
-      <p class="dialog-note"><strong>Seed songs</strong><span>Choose “Use as seed” to remember songs for your next generated mix. Set whether they stay in that mix with the option in the mix builder.</span></p>
+      <p class="dialog-note"><strong>My picks</strong><span>Picks can be added to a mix, make up the whole mix, or just guide which new songs Side B finds. Choose with the My picks option in the mix builder.</span></p>
+    </dialog>
+    <dialog id="queue-dialog" class="info-dialog list-dialog">
+      <button class="dialog-close" data-close-dialog="queue-dialog" type="button" aria-label="Close">×</button>
+      <p class="eyebrow small-eyebrow">UP NEXT</p>
+      <h2>Queue</h2>
+      <p id="queue-summary">The songs coming up in this mix.</p>
+      <div class="search-result-list" id="queue-list"></div>
+    </dialog>
+    <dialog id="picks-dialog" class="info-dialog list-dialog">
+      <button class="dialog-close" data-close-dialog="picks-dialog" type="button" aria-label="Close">×</button>
+      <p class="eyebrow small-eyebrow">YOUR CHOICE</p>
+      <h2>My picks</h2>
+      <p>Songs you chose with “Add to my picks” in Add songs. Choose how a mix uses them with the My picks option before making it.</p>
+      <p class="dialog-status" role="status" aria-live="polite"></p>
+      <div class="search-result-list" id="picks-list"></div>
+      <div class="dialog-buttons"><button class="dialog-done" id="picks-clear" type="button">Clear picks</button><button class="dialog-connect" id="picks-add" type="button">Add songs</button></div>
     </dialog>
     <dialog id="playlist-import-dialog" class="info-dialog list-dialog">
       <button class="dialog-close" data-close-dialog="playlist-import-dialog" type="button" aria-label="Close">×</button>
       <p class="eyebrow small-eyebrow">BRING YOUR MUSIC</p>
       <h2>Import a playlist</h2>
-      <p>Import from Spotify or a Side B JSON/CSV file. Connect Spotify and choose “Export to Spotify” to create a Spotify playlist; Side B matches imported songs and lists anything it cannot find.</p>
+      <p>Import from Spotify or a Side B JSON/CSV file. Press Play to hear it on Spotify, or “Save to Spotify” to keep it as its own playlist; Side B matches imported songs and lists anything it cannot find.</p>
       <label class="client-id-label" for="playlist-file-input">SIDEB PLAYLIST FILE</label>
       <input class="client-id-input" id="playlist-file-input" type="file" accept="application/json,.json,text/csv,.csv">
       <button class="secondary-button spotify-playlist-import" id="spotify-playlist-import" type="button">Choose a Spotify playlist</button>
