@@ -73,7 +73,7 @@
               <span>Connect Spotify</span>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
             </button>
-            <button class="spotify-connect platforms-button" id="platforms-button" type="button">More platforms</button>
+            <button class="spotify-connect platforms-button hidden" id="platforms-button" type="button">More platforms</button>
           </div>
         </header>
 
@@ -229,6 +229,7 @@
       <h2>Add songs or seed your next mix</h2>
       <p>Search the sample catalog or Spotify. Added seed songs can stay in the next mix or guide recommendations only.</p>
       <input class="client-id-input" id="track-search-input" type="search" placeholder="Search songs or artists" autocomplete="off">
+      <p class="dialog-status" role="status" aria-live="polite"></p>
       <div class="search-result-list" id="search-result-list"></div>
       <p class="dialog-note"><strong>Seed songs</strong><span>Choose “Use as seed” to remember songs for your next generated mix. Set whether they stay in that mix with the option in the mix builder.</span></p>
     </dialog>
@@ -240,6 +241,7 @@
       <label class="client-id-label" for="playlist-file-input">SIDEB PLAYLIST FILE</label>
       <input class="client-id-input" id="playlist-file-input" type="file" accept="application/json,.json,text/csv,.csv">
       <button class="secondary-button spotify-playlist-import" id="spotify-playlist-import" type="button">Choose a Spotify playlist</button>
+      <p class="dialog-status" role="status" aria-live="polite"></p>
       <div class="search-result-list" id="spotify-playlist-list"></div>
     </dialog>
     <dialog id="unmatched-dialog" class="info-dialog list-dialog compact-dialog">

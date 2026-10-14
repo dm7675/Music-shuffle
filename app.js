@@ -54,7 +54,7 @@ const state = {
   saved: readStorage(storageKeys.saved, []),
   discoveries: readStorage(storageKeys.discoveries, []),
   liked: readStorage(storageKeys.likes, []),
-  held: readStorage(storageKeys.held, {}),
+  held: readHeldTracks(),
   heard: readStorage(storageKeys.heard, []),
   seedTracks: readStorage(storageKeys.seeds, []),
   seedMode: "keep",
@@ -96,6 +96,12 @@ function readStorage(key, fallback) {
   }
 }
 
+// Earlier versions saved a cleared hold list as [] instead of {}.
+function readHeldTracks() {
+  const held = readStorage(storageKeys.held, {});
+  return Array.isArray(held) ? {} : held;
+}
+
 function writeStorage(key, value) {
   try {
     localStorage.setItem(key, JSON.stringify(value));
@@ -107,10 +113,17 @@ function writeStorage(key, value) {
   return true;
 }
 
+// Expired holds stay stored so repeated skips keep lengthening the cooldown.
+function isHoldActive(entry) {
+  return Boolean(entry && (entry.blocked || Date.parse(entry.heldUntil) > Date.now()));
+}
+
+function activeHeldEntries() {
+  return Object.values(state.held).filter(isHoldActive);
+}
+
 function isTrackUnavailable(track) {
-  const entry = state.held[track.id];
-  if (entry?.blocked) return true;
-  return Boolean(entry && Date.parse(entry.heldUntil) > Date.now());
+  return isHoldActive(state.held[track.id]);
 }
 
 function markTrackHeard(track) {
@@ -121,7 +134,7 @@ function markTrackHeard(track) {
     state.heard = nextHeard;
   }
   const nextHeld = { ...state.held };
-  if (nextHeld[track.id]) {
+  if (nextHeld[track.id] && !nextHeld[track.id].blocked) {
     delete nextHeld[track.id];
     if (writeStorage(storageKeys.held, nextHeld)) state.held = nextHeld;
   }
@@ -158,19 +171,22 @@ function recordListening(track, positionSeconds, isPlaying) {
 
 function holdSkippedTrack(track, progressSeconds) {
   if (!track?.id) return;
+  // A song heard past 60% counts as listened, so moving on from it isn't a skip.
+  if (listenedSeconds(track) / track.duration >= heardThreshold) {
+    markTrackHeard(track);
+    if (track.type === "discovery") saveDiscovery(track);
+    return;
+  }
   const previous = state.held[track.id];
   const skipCount = (previous?.skipCount || 0) + 1;
   const holdDays = Math.min(30, 3 * (2 ** (skipCount - 1)));
   const heldUntil = new Date(Date.now() + holdDays * 24 * 60 * 60 * 1000).toISOString();
-  const heard = listenedSeconds(track) / track.duration >= heardThreshold;
-  if (heard) markTrackHeard(track);
   const nextHeld = {
     ...state.held,
     [track.id]: {
       track,
       skipCount,
       heldUntil,
-      heard,
       earlySkip: progressSeconds / track.duration < 0.3,
       blocked: false,
       lastSkippedAt: new Date().toISOString()
@@ -179,11 +195,9 @@ function holdSkippedTrack(track, progressSeconds) {
   if (!writeStorage(storageKeys.held, nextHeld)) return;
   state.held = nextHeld;
   updateCounts();
-  showToast(heard
-    ? `"${track.title}" was marked heard and held back for ${holdDays} days.`
-    : nextHeld[track.id].earlySkip
-      ? `"${track.title}" was skipped early and held back for ${holdDays} days.`
-      : `"${track.title}" was held back for ${holdDays} days after the skip.`);
+  showToast(nextHeld[track.id].earlySkip
+    ? `"${track.title}" was skipped early and held back for ${holdDays} days.`
+    : `"${track.title}" was held back for ${holdDays} days after the skip.`);
 }
 
 function releaseHeldTrack(trackId, blocked = false) {
@@ -298,8 +312,12 @@ async function exchangeSpotifyToken(body) {
     }
     throw new Error(`Couldn't reach Spotify sign-in: ${error.message}`);
   }
-  const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error_description || payload.error || `Spotify sign-in failed (${response.status}).`);
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(payload.error_description || payload.error || `Spotify sign-in failed (${response.status}).`);
+    error.status = response.status;
+    throw error;
+  }
   const previousSession = readSpotifySession();
   const session = {
     access_token: payload.access_token,
@@ -311,20 +329,51 @@ async function exchangeSpotifyToken(body) {
   return session;
 }
 
-async function getSpotifyAccessToken() {
+const spotifyExpiredMessage = "Your Spotify session expired. Reconnect Spotify.";
+
+// Clears a session Spotify no longer accepts so the UI asks to reconnect instead of showing "connected".
+function endSpotifySession(message = spotifyExpiredMessage) {
+  sessionStorage.removeItem(spotifyTokenKey);
+  if (!state.spotifyUser) return;
+  stopPlayback();
+  disconnectSpotifyWebPlayer();
+  state.spotifyUser = null;
+  state.spotifyPlaylist = null;
+  state.spotifyError = message;
+  updateSpotifyUi();
+  renderPlaylist();
+  showToast(message);
+}
+
+async function getSpotifyAccessToken({ forceRefresh = false } = {}) {
   let session = readSpotifySession();
-  if (!session?.access_token) throw new Error("Connect your Spotify account to continue.");
-  if (session.expires_at > Date.now() + 30_000) return session.access_token;
-  if (!session.refresh_token) throw new Error("Your Spotify session expired. Connect Spotify again.");
-  session = await exchangeSpotifyToken({
-    grant_type: "refresh_token",
-    refresh_token: session.refresh_token
-  });
+  if (!session?.access_token) {
+    if (state.spotifyUser) endSpotifySession();
+    throw new Error(state.spotifyError || "Connect your Spotify account to continue.");
+  }
+  if (!forceRefresh && session.expires_at > Date.now() + 30_000) return session.access_token;
+  if (!session.refresh_token) {
+    endSpotifySession();
+    throw new Error(spotifyExpiredMessage);
+  }
+  try {
+    session = await exchangeSpotifyToken({
+      grant_type: "refresh_token",
+      refresh_token: session.refresh_token
+    });
+  } catch (error) {
+    // Only a rejection from Spotify ends the session; a network failure can be retried.
+    if (error.status) {
+      endSpotifySession();
+      throw new Error(spotifyExpiredMessage);
+    }
+    throw error;
+  }
   return session.access_token;
 }
 
-async function spotifyRequest(endpoint, options = {}) {
-  const token = await getSpotifyAccessToken();
+async function spotifyRequest(endpoint, options = {}, retried = false) {
+  const token = await getSpotifyAccessToken({ forceRefresh: retried });
   let response;
   try {
     response = await fetch(`/spotify/api/v1${endpoint}`, {
@@ -342,10 +391,15 @@ async function spotifyRequest(endpoint, options = {}) {
     }
     throw new Error(`Couldn't reach Spotify: ${error.message}`);
   }
+  if (response.status === 401) {
+    // The token can be revoked or expire early; refresh once before giving up on the session.
+    if (!retried && readSpotifySession()?.refresh_token) return spotifyRequest(endpoint, options, true);
+    endSpotifySession();
+    throw new Error(spotifyExpiredMessage);
+  }
   const payload = response.status === 204 ? null : await response.json().catch(() => null);
   if (!response.ok) {
     const reason = payload?.error?.message || payload?.error_description || `Spotify API request failed (${response.status}).`;
-    if (response.status === 401) sessionStorage.removeItem(spotifyTokenKey);
     throw new Error(`${reason} (${endpoint})`);
   }
   return payload;
@@ -389,7 +443,7 @@ function updateSpotifyUi() {
   $("#connect-button").querySelector("span:nth-child(2)").textContent = connected
     ? "Spotify connected"
     : state.spotifyConnecting ? "Connecting…"
-      : state.spotifyError ? "Retry Spotify" : "Connect Spotify";
+      : state.spotifyError ? "Reconnect Spotify" : "Connect Spotify";
   $("#save-button").querySelector("span").textContent = state.currentSavedMixId
     ? state.spotifyPlaylist && connected ? "Update Spotify" : "Update saved mix"
     : connected ? "Export to Spotify" : "Save mix";
@@ -652,6 +706,7 @@ function renderPlaylist() {
   $("#play-all-button").querySelector("span").textContent = state.spotifyPlaylist
     ? "Play on Spotify"
     : "Play mix";
+  updatePlayerHeart();
 }
 
 function createTrackRow(track, index, collection, collectionType = "") {
@@ -746,7 +801,7 @@ function createTrackRow(track, index, collection, collectionType = "") {
     whyText.className = "hold-reason";
     whyText.textContent = entry.blocked
       ? "Blocked until you allow it"
-      : `${entry.heard ? "Heard · cooldown" : entry.earlySkip ? "Early skip" : "Skipped"} · eligible ${new Date(entry.heldUntil).toLocaleDateString()}`;
+      : `${entry.earlySkip ? "Early skip" : "Skipped"} · eligible ${new Date(entry.heldUntil).toLocaleDateString()}`;
     why.append(whyText);
   }
   row.append(rank, play, main, why, time);
@@ -795,16 +850,17 @@ function rememberSeed(track) {
 function addTrackToMix(track) {
   if (state.held[track.id]?.blocked) {
     showToast(`"${track.title}" is blocked. Allow it from Held back before adding it.`);
-    return;
+    return false;
   }
   if (state.playlist.some((existing) => existing.id === track.id)) {
     showToast(`"${track.title}" is already in this mix.`);
-    return;
+    return false;
   }
   state.playlist = [...state.playlist, track];
   renderPlaylist();
   persistEditedSavedMix();
   showToast(`Added "${track.title}" to this mix.`);
+  return true;
 }
 
 function renderSearchResults(results) {
@@ -832,8 +888,15 @@ function renderSearchResults(results) {
     const add = document.createElement("button");
     add.type = "button";
     add.className = "text-button";
+    const markInMix = () => {
+      add.textContent = "In mix";
+      add.disabled = true;
+    };
     add.textContent = "Add to mix";
-    add.addEventListener("click", () => addTrackToMix(track));
+    if (state.playlist.some((existing) => existing.id === track.id)) markInMix();
+    add.addEventListener("click", () => {
+      if (addTrackToMix(track)) markInMix();
+    });
     const seed = document.createElement("button");
     seed.type = "button";
     seed.className = "text-button";
@@ -865,7 +928,8 @@ async function searchSongs(query) {
   const term = query.trim();
   if (!term) return;
   if (state.spotifyUser) {
-    const params = new URLSearchParams({ q: term, type: "track", limit: "15" });
+    // Spotify lowered the development-mode search limit to 10 results in 2026.
+    const params = new URLSearchParams({ q: term, type: "track", limit: "10" });
     if (state.spotifyUser.country) params.set("market", state.spotifyUser.country);
     try {
       const result = await spotifyRequest(`/search?${params.toString()}`);
@@ -891,6 +955,7 @@ async function searchSongs(query) {
 function openTrackSearch() {
   $("#track-search-input").value = "";
   $("#search-result-list").replaceChildren();
+  $("#track-search-dialog .dialog-status").textContent = "";
   $("#track-search-dialog").showModal();
   $("#track-search-input").focus();
 }
@@ -1220,6 +1285,15 @@ async function loadSpotifyPlaylists() {
   }
 }
 
+function updatePlayerHeart() {
+  const track = state.playlist[state.activeIndex];
+  const liked = Boolean(track && state.liked.includes(track.id));
+  const heart = $("#player-heart");
+  heart.classList.toggle("liked", liked);
+  heart.textContent = liked ? "♥" : "♡";
+  heart.setAttribute("aria-label", liked ? "Unlike this track" : "Like this track");
+}
+
 function toggleLike(track) {
   const wasLiked = state.liked.includes(track.id);
   const nextLikes = wasLiked ? state.liked.filter((id) => id !== track.id) : [...state.liked, track.id];
@@ -1430,7 +1504,11 @@ function startSpotifyWebPlayer() {
 }
 
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") void retryPendingSpotifyPlay();
+  if (document.visibilityState !== "visible") return;
+  void retryPendingSpotifyPlay();
+  if (state.remotePlayback) {
+    void pollSpotifyPlayback().catch((error) => console.error("Spotify progress refresh failed.", error));
+  }
 });
 
 async function startSpotifyPlayback(index, playlistUri = null) {
@@ -1538,9 +1616,9 @@ function togglePlayback() {
 function nextTrack() {
   if (state.playlist.length === 0) return;
   if (state.remotePlayback && state.playlist[state.activeIndex]?.spotifyUri) {
-    holdSkippedTrack(state.playlist[state.activeIndex], state.elapsed);
-    const nextIndex = (state.activeIndex + 1) % state.playlist.length;
-    void startSpotifyPlayback(nextIndex).catch((error) => {
+    // Activate while still inside the click; skipSpotifyTrack awaits before starting playback.
+    void state.webPlayer?.activateElement?.();
+    void skipSpotifyTrack().catch((error) => {
       showToast(`Couldn't skip in Spotify: ${error.message}`);
       console.error("Spotify track skip failed.", error);
     });
@@ -1550,6 +1628,18 @@ function nextTrack() {
     holdSkippedTrack(state.playlist[state.activeIndex], state.elapsed);
   }
   playTrack((state.activeIndex + 1) % state.playlist.length);
+}
+
+// Progress may be stale after the page was in the background, so refresh it before judging the skip.
+async function skipSpotifyTrack() {
+  try {
+    await pollSpotifyPlayback();
+  } catch (error) {
+    console.error("Couldn't refresh Spotify progress before skipping.", error);
+  }
+  const track = state.playlist[state.activeIndex];
+  if (track) holdSkippedTrack(track, state.elapsed);
+  await startSpotifyPlayback((state.activeIndex + 1) % state.playlist.length);
 }
 
 function previousTrack() {
@@ -1729,7 +1819,7 @@ async function saveMix() {
 
 function updateCounts() {
   $("#discovery-count").textContent = state.discoveries.length;
-  $("#held-count").textContent = Object.keys(state.held).length;
+  $("#held-count").textContent = activeHeldEntries().length;
 }
 
 function selectPeriod(period) {
@@ -1764,15 +1854,16 @@ function renderCollection() {
   const isHeld = state.currentView === "held";
   const collectionEmpty = $("#collection-empty");
   if (isHeld) {
+    const heldEntries = activeHeldEntries();
     $("#empty-state-title").textContent = "Nothing is held back.";
     $("#empty-state-copy").textContent = "Songs skipped before 60% will be saved here, where you can return them to rotation or block them.";
-    $("#collection-count").textContent = `${Object.keys(state.held).length} songs held or blocked`;
+    $("#collection-count").textContent = `${heldEntries.length} ${heldEntries.length === 1 ? "song" : "songs"} held or blocked`;
     $("#clear-collection").textContent = "Clear hold list";
-    Object.values(state.held).forEach((entry, index) => {
+    heldEntries.forEach((entry, index) => {
       collectionList.append(createTrackRow(entry.track, index, true, "held"));
     });
-    collectionEmpty.classList.toggle("hidden", Object.keys(state.held).length > 0);
-    $("#clear-collection").classList.toggle("hidden", Object.keys(state.held).length === 0);
+    collectionEmpty.classList.toggle("hidden", heldEntries.length > 0);
+    $("#clear-collection").classList.toggle("hidden", heldEntries.length === 0);
     $("#back-to-mix").classList.remove("hidden");
     return;
   }
@@ -1843,6 +1934,9 @@ function renderCollection() {
 
 let toastTimeout;
 function showToast(message, action = null) {
+  // An open modal dialog covers the toast, so repeat the message inside the dialog.
+  const dialogStatus = document.querySelector("dialog[open] .dialog-status");
+  if (dialogStatus) dialogStatus.textContent = message;
   const toast = $("#toast");
   toast.textContent = message;
   toast.classList.toggle("has-action", Boolean(action));
@@ -1971,6 +2065,7 @@ $("#export-playlist-button").addEventListener("click", exportPlaylistFile);
 $("#export-csv-button").addEventListener("click", exportPlaylistCsv);
 $("#import-playlist-button").addEventListener("click", () => {
   $("#spotify-playlist-list").replaceChildren();
+  $("#playlist-import-dialog .dialog-status").textContent = "";
   $("#playlist-import-dialog").showModal();
 });
 $("#spotify-playlist-import").addEventListener("click", () => { void loadSpotifyPlaylists(); });
@@ -2149,7 +2244,7 @@ $("#back-to-mix").addEventListener("click", () => setView("mix"));
 $("#clear-collection").addEventListener("click", () => {
   const storageKey = state.currentView === "discoveries" ? storageKeys.discoveries
     : state.currentView === "held" ? storageKeys.held : storageKeys.saved;
-  if (!writeStorage(storageKey, [])) return;
+  if (!writeStorage(storageKey, state.currentView === "held" ? {} : [])) return;
   if (state.currentView === "discoveries") {
     state.discoveries = [];
   } else if (state.currentView === "held") {

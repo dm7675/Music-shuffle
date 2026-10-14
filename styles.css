@@ -252,6 +252,7 @@ input[type="range"]::-moz-range-thumb { width: 9px; height: 9px; border: 2px sol
 .dialog-icon { width: 36px; height: 36px; display: grid; place-items: center; margin-bottom: 19px; border-radius: 8px; color: var(--lime); background: #293020; font-size: 20px; }
 .info-dialog h2 { margin: 0 0 10px; font: 500 23px "Space Grotesk", sans-serif; }
 .info-dialog > p:not(.eyebrow) { color: #a4a89d; font-size: 11px; line-height: 1.7; }
+.info-dialog > p.dialog-status { min-height: 17px; margin: 8px 0 0; color: var(--lime); font-size: 10px; }
 .client-id-label { display: block; margin: 17px 0 7px; color: #a5aa98; font: 600 8px "Space Grotesk", sans-serif; letter-spacing: 1px; }
 .client-id-input { width: 100%; padding: 11px 12px; border: 1px solid #42463b; border-radius: 5px; color: var(--text); background: #11130f; font: 11px "DM Sans", sans-serif; }
 .redirect-box { position: relative; display: grid; gap: 6px; margin-top: 12px; padding: 10px 60px 10px 11px; border: 1px solid #30342d; border-radius: 5px; background: #151713; }
