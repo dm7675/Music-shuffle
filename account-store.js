@@ -114,6 +114,10 @@ function createAccountStore({ databasePath, encryptionKey }) {
   if (!db.prepare("PRAGMA table_info(track_state)").all().some((column) => column.name === "liked_at")) {
     db.exec("ALTER TABLE track_state ADD COLUMN liked_at INTEGER");
   }
+  // Also added later: early skips since the song was last heard, so repeated early skips can block it.
+  if (!db.prepare("PRAGMA table_info(track_state)").all().some((column) => column.name === "early_skip_count")) {
+    db.exec("ALTER TABLE track_state ADD COLUMN early_skip_count INTEGER NOT NULL DEFAULT 0");
+  }
   db.exec(`CREATE TABLE IF NOT EXISTS saved_mixes (
     user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
     mixes_json TEXT NOT NULL,
@@ -153,13 +157,13 @@ function createAccountStore({ databasePath, encryptionKey }) {
     userTracks: db.prepare("SELECT * FROM track_state WHERE user_id = ?"),
     upsertTrack: db.prepare(`
       INSERT INTO track_state (user_id, track_id, track_json, heard_at, discovered_at, skip_count, held_until,
-        early_skip, blocked, last_skipped_at, song_key)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        early_skip, blocked, last_skipped_at, song_key, early_skip_count)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT (user_id, track_id) DO UPDATE SET track_json = COALESCE(excluded.track_json, track_json),
         song_key = COALESCE(excluded.song_key, song_key),
         heard_at = excluded.heard_at, discovered_at = excluded.discovered_at, skip_count = excluded.skip_count,
         held_until = excluded.held_until, early_skip = excluded.early_skip, blocked = excluded.blocked,
-        last_skipped_at = excluded.last_skipped_at`),
+        last_skipped_at = excluded.last_skipped_at, early_skip_count = excluded.early_skip_count`),
     clearDiscoveries: db.prepare("UPDATE track_state SET discovered_at = NULL WHERE user_id = ?"),
     setLiked: db.prepare("UPDATE track_state SET liked_at = ? WHERE user_id = ? AND track_id = ?"),
     getSavedMixes: db.prepare("SELECT mixes_json, updated_at FROM saved_mixes WHERE user_id = ?"),
@@ -167,7 +171,7 @@ function createAccountStore({ databasePath, encryptionKey }) {
       ON CONFLICT (user_id) DO UPDATE SET mixes_json = excluded.mixes_json, updated_at = excluded.updated_at`),
     removeDiscovery: db.prepare("UPDATE track_state SET discovered_at = NULL WHERE user_id = ? AND track_id = ?"),
     clearHolds: db.prepare(`UPDATE track_state SET skip_count = 0, held_until = NULL, early_skip = 0, blocked = 0,
-      last_skipped_at = NULL WHERE user_id = ?`)
+      last_skipped_at = NULL, early_skip_count = 0 WHERE user_id = ?`)
   };
 
   function transaction(work) {
@@ -203,7 +207,8 @@ function createAccountStore({ databasePath, encryptionKey }) {
   function writeTrack(userId, trackId, row) {
     const songKey = row.track_json ? rules.songKey(JSON.parse(row.track_json)) || null : null;
     statements.upsertTrack.run(userId, trackId, row.track_json ?? null, row.heard_at ?? null, row.discovered_at ?? null,
-      row.skip_count ?? 0, row.held_until ?? null, row.early_skip ?? 0, row.blocked ?? 0, row.last_skipped_at ?? null, songKey);
+      row.skip_count ?? 0, row.held_until ?? null, row.early_skip ?? 0, row.blocked ?? 0, row.last_skipped_at ?? null, songKey,
+      row.early_skip_count ?? 0);
   }
 
   // discoverIfNew is for listening seen in Spotify history: a song becomes a discovery only if it wasn't already known.
@@ -223,7 +228,7 @@ function createAccountStore({ databasePath, encryptionKey }) {
       heard_at: existing?.heard_at || at,
       discovered_at: existing?.discovered_at || (discovery ? at : null),
       // Hearing a song past 60% returns it to rotation, unless it was blocked by hand.
-      ...(released ? { skip_count: 0, held_until: null, early_skip: 0, last_skipped_at: null } : {})
+      ...(released ? { skip_count: 0, held_until: null, early_skip: 0, last_skipped_at: null, early_skip_count: 0 } : {})
     });
     return { wasKnown, discovered: !existing?.discovered_at && discovery };
   }
@@ -237,14 +242,16 @@ function createAccountStore({ databasePath, encryptionKey }) {
   function applySkip(userId, track, progressRatio, at = Date.now()) {
     const existing = statements.getTrack.get(userId, track.id);
     if (existing?.blocked) return null;
-    const hold = rules.nextHold({ skipCount: existing?.skip_count || 0 }, progressRatio, at);
+    const hold = rules.nextHold({ skipCount: existing?.skip_count || 0, earlySkipCount: existing?.early_skip_count || 0 },
+      progressRatio, at);
     writeTrack(userId, track.id, {
       ...existing,
       track_json: JSON.stringify(track),
       skip_count: hold.skipCount,
-      held_until: Date.parse(hold.heldUntil),
+      early_skip_count: hold.earlySkipCount,
+      held_until: hold.heldUntil ? Date.parse(hold.heldUntil) : null,
       early_skip: hold.earlySkip ? 1 : 0,
-      blocked: 0,
+      blocked: hold.blocked ? 1 : 0,
       last_skipped_at: at
     });
     return hold;
@@ -253,7 +260,13 @@ function createAccountStore({ databasePath, encryptionKey }) {
   function releaseHold(userId, trackId, blocked, at = Date.now()) {
     const existing = statements.getTrack.get(userId, trackId);
     if (!existing) return;
-    writeTrack(userId, trackId, { ...existing, blocked: blocked ? 1 : 0, held_until: blocked ? null : at });
+    writeTrack(userId, trackId, {
+      ...existing,
+      blocked: blocked ? 1 : 0,
+      held_until: blocked ? null : at,
+      // Allowing a blocked song again gives it a fresh start: its next skip is treated like a first skip.
+      ...(existing.blocked && !blocked ? { early_skip_count: 0, skip_count: 0 } : {})
+    });
   }
 
   function setLiked(userId, track, liked, at = Date.now()) {
@@ -270,6 +283,7 @@ function createAccountStore({ databasePath, encryptionKey }) {
       held[row.track_id] = {
         track: JSON.parse(row.track_json),
         skipCount: row.skip_count,
+        earlySkipCount: row.early_skip_count || 0,
         heldUntil: isoOrNull(row.held_until),
         earlySkip: Boolean(row.early_skip),
         blocked: Boolean(row.blocked),
@@ -329,6 +343,7 @@ function createAccountStore({ databasePath, encryptionKey }) {
             ...existing,
             track_json: JSON.stringify(track),
             skip_count: skipCount,
+            early_skip_count: Math.min(20, Math.max(0, Math.floor(Number(entry.earlySkipCount) || 0))),
             held_until: entry.blocked ? null : Date.parse(entry.heldUntil) || null,
             early_skip: entry.earlySkip ? 1 : 0,
             blocked: entry.blocked ? 1 : 0,

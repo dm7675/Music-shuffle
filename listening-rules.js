@@ -6,11 +6,13 @@
 })(typeof self !== "undefined" ? self : globalThis, () => {
   const heardThreshold = 0.6;
   const earlySkipThreshold = 0.3;
+  // This many skips before 30% (counted since the song was last heard past 60%, or allowed again) blocks the song.
+  const earlySkipsToBlock = 3;
   const dayMs = 24 * 60 * 60 * 1000;
 
-  // Each repeat skip doubles the cooldown: 3, 6, 12, 24, then 30 days.
-  function holdDaysFor(skipCount) {
-    return Math.min(30, 3 * (2 ** (skipCount - 1)));
+  // Each repeat skip doubles the cooldown: 3, 6, 12, 24, then 30 days. Skipping before 30% doubles it once more.
+  function holdDaysFor(skipCount, earlySkip = false) {
+    return Math.min(30, 3 * (2 ** (skipCount - 1)) * (earlySkip ? 2 : 1));
   }
 
   // Expired holds stay stored so repeated skips keep lengthening the cooldown.
@@ -20,13 +22,17 @@
 
   function nextHold(previous, progressRatio, now = Date.now()) {
     const skipCount = (previous?.skipCount || 0) + 1;
-    const holdDays = holdDaysFor(skipCount);
+    const earlySkip = progressRatio < earlySkipThreshold;
+    const earlySkipCount = (previous?.earlySkipCount || 0) + (earlySkip ? 1 : 0);
+    const blocked = earlySkipCount >= earlySkipsToBlock;
+    const holdDays = holdDaysFor(skipCount, earlySkip);
     return {
       skipCount,
+      earlySkipCount,
       holdDays,
-      heldUntil: new Date(now + holdDays * dayMs).toISOString(),
-      earlySkip: progressRatio < earlySkipThreshold,
-      blocked: false,
+      heldUntil: blocked ? null : new Date(now + holdDays * dayMs).toISOString(),
+      earlySkip,
+      blocked,
       lastSkippedAt: new Date(now).toISOString()
     };
   }
@@ -90,5 +96,5 @@
     return decisions;
   }
 
-  return { heardThreshold, earlySkipThreshold, holdDaysFor, isHoldActive, nextHold, songKey, detectTimestampMode, classifyPlays };
+  return { heardThreshold, earlySkipThreshold, earlySkipsToBlock, holdDaysFor, isHoldActive, nextHold, songKey, detectTimestampMode, classifyPlays };
 });

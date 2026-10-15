@@ -210,9 +210,11 @@ function holdSkippedTrack(track, progressSeconds) {
   if (!hold) return;
   rememberAppListen(track);
   reportListening({ type: "skip", track: accountTrack(track), progressRatio });
-  showToast(hold.earlySkip
-    ? `"${track.title}" was skipped early and held back for ${hold.holdDays} days.`
-    : `"${track.title}" was held back for ${hold.holdDays} days after the skip.`);
+  showToast(hold.blocked
+    ? `"${track.title}" was skipped early ${hold.earlySkipCount} times, so it's blocked. Allow it again from Held back.`
+    : hold.earlySkip
+      ? `"${track.title}" was skipped early and held back for ${hold.holdDays} days.`
+      : `"${track.title}" was held back for ${hold.holdDays} days after the skip.`);
 }
 
 // Returns the new hold, or null when the song is blocked: a blocked song stays blocked.
@@ -249,10 +251,9 @@ function removeDiscovery(track) {
 function releaseHeldTrack(trackId, blocked = false) {
   const entry = state.held[trackId];
   if (!entry) return;
-  const nextHeld = {
-    ...state.held,
-    [trackId]: { ...entry, blocked, heldUntil: blocked ? null : new Date().toISOString() }
-  };
+  const nextHeld = { ...state.held, [trackId]: { ...entry, blocked, heldUntil: blocked ? null : new Date().toISOString() } };
+  // Allowing a blocked song again gives it a fresh start: it leaves Held back and its next skip counts as a first skip.
+  if (entry.blocked && !blocked) delete nextHeld[trackId];
   if (!writeStorage(storageKeys.held, nextHeld)) return;
   state.held = nextHeld;
   updateCounts();
@@ -1286,7 +1287,7 @@ function createTrackRow(track, index, collection, collectionType = "") {
     const whyText = document.createElement("span");
     whyText.className = "hold-reason";
     whyText.textContent = entry.blocked
-      ? "Blocked until you allow it"
+      ? (entry.earlySkipCount >= listeningRules.earlySkipsToBlock ? `Blocked after ${entry.earlySkipCount} early skips` : "Blocked until you allow it")
       : `${entry.earlySkip ? "Early skip" : "Skipped"} · eligible ${new Date(entry.heldUntil).toLocaleDateString()}`;
     why.append(whyText);
   }
