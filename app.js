@@ -69,6 +69,8 @@ const state = {
   remoteTimer: null,
   remotePlayback: false,
   lastRemoteTrackId: null,
+  // What the last progress check saw, so a tap can act without asking Spotify again first.
+  lastSpotifyPlayback: null,
   currentSavedMixId: null,
   currentView: "mix",
   spotifyUser: null,
@@ -159,16 +161,20 @@ function recordListening(track, positionSeconds, isPlaying) {
   const now = Date.now();
   let session = state.listenSession;
   if (!session || session.trackId !== track.id) {
+    // A song that started since the last check (even while the phone screen was off) gets its time so far.
+    const secondsSinceLastCheck = session ? (now - session.lastCheckedAt) / 1000 : 5;
     session = state.listenSession = {
       trackId: track.id,
-      listened: isPlaying && positionSeconds <= 5 ? positionSeconds : 0,
+      listened: isPlaying && positionSeconds <= secondsSinceLastCheck + 2 ? positionSeconds : 0,
       lastPosition: positionSeconds,
       lastCheckedAt: now
     };
   } else {
+    // Network delay varies between checks, so progress can run a little ahead of the clock. Cap it at the
+    // time that passed instead of dropping it, so a slow connection doesn't lose listening but a seek still can't add any.
     const progressed = positionSeconds - session.lastPosition;
     const wallSeconds = (now - session.lastCheckedAt) / 1000;
-    if (isPlaying && progressed > 0 && progressed <= wallSeconds + 2) session.listened += progressed;
+    if (isPlaying && progressed > 0) session.listened += Math.min(progressed, wallSeconds + 2);
     session.lastPosition = positionSeconds;
     session.lastCheckedAt = now;
   }
@@ -2192,7 +2198,9 @@ async function startSpotifyPlayback(index, playlistUri = null, step = 1) {
   if (index < 0) throw new Error("None of the songs in this mix could be found on Spotify.");
   const track = state.playlist[index];
   const contextUri = playlistUri;
-  const deviceId = await findSpotifyPlaybackDevice();
+  const recent = state.lastSpotifyPlayback;
+  const knownDeviceId = recent?.deviceId && Date.now() - recent.at < 30_000 ? recent.deviceId : null;
+  const deviceId = knownDeviceId || await findSpotifyPlaybackDevice();
   if (!deviceId) {
     promptOpenSpotifyApp(index, contextUri);
     return;
@@ -2200,12 +2208,19 @@ async function startSpotifyPlayback(index, playlistUri = null, step = 1) {
   clearPendingSpotifyPlay();
   if (state.remoteTimer) window.clearInterval(state.remoteTimer);
   state.remoteTimer = null;
-  await spotifyRequest(`/me/player/play?device_id=${encodeURIComponent(deviceId)}`, {
-    method: "PUT",
-    body: JSON.stringify(contextUri
-      ? { context_uri: contextUri, offset: { uri: track.spotifyUri } }
-      : { uris: playableUris(), offset: { uri: track.spotifyUri } })
-  });
+  const body = JSON.stringify(contextUri
+    ? { context_uri: contextUri, offset: { uri: track.spotifyUri } }
+    : { uris: playableUris(), offset: { uri: track.spotifyUri } });
+  try {
+    await spotifyRequest(`/me/player/play?device_id=${encodeURIComponent(deviceId)}`, { method: "PUT", body });
+  } catch (error) {
+    // The remembered device may have gone to sleep since the last check; look the devices up and try once more.
+    if (!knownDeviceId || error.status !== 404) throw error;
+    state.lastSpotifyPlayback = null;
+    await startSpotifyPlayback(index, playlistUri, step);
+    return;
+  }
+  state.lastSpotifyPlayback = { isPlaying: true, deviceId, at: Date.now() };
   state.activeIndex = index;
   state.elapsed = 0;
   // Side B started this song from 0:00, so count from now even if the page is backgrounded before Spotify confirms it.
@@ -2298,6 +2313,7 @@ async function pollSpotifyPlayback() {
     return;
   }
   if (isStaleSpotifyReport(playback)) return;
+  state.lastSpotifyPlayback = { isPlaying: Boolean(playback.is_playing), deviceId: playback.device?.id || null, at: Date.now() };
   const track = state.playlist.find((candidate) => candidate.spotifyUri === playback.item.uri);
   if (!track) {
     noteSpotifyAway(`Spotify is playing "${playback.item.name}", which isn't in this mix.`);
@@ -2349,8 +2365,25 @@ function togglePlayback() {
   }
 }
 
-// Decides from Spotify's real state, not the button, since playback may have been paused elsewhere.
+// Decides from Spotify's real state (the last check, or a fresh one), not the button, since playback may have been paused elsewhere.
 async function toggleSpotifyPlayback() {
+  const recent = state.lastSpotifyPlayback;
+  // While Side B is following Spotify it checks every 3 seconds, so that answer is fresh enough to act on
+  // right away; the button flips at once and only one request is sent.
+  if (state.remotePlayback && recent && Date.now() - recent.at < 8000) {
+    const play = !recent.isPlaying;
+    showPlayingState(play);
+    expectSpotifyState({ isPlaying: play });
+    try {
+      await spotifyRequest(`/me/player/${play ? "play" : "pause"}`, { method: "PUT" });
+      state.lastSpotifyPlayback = { ...recent, isPlaying: play, at: Date.now() };
+    } catch (error) {
+      showPlayingState(!play);
+      state.expectedSpotify = null;
+      throw error;
+    }
+    return;
+  }
   const playback = await spotifyRequest("/me/player");
   if (!state.remotePlayback) {
     // If Spotify is still on a song from this mix (tracking stopped, or the page reloaded), follow it again
@@ -2361,6 +2394,7 @@ async function toggleSpotifyPlayback() {
       return;
     }
     if (!playback.is_playing) await spotifyRequest("/me/player/play", { method: "PUT" });
+    state.lastSpotifyPlayback = { isPlaying: true, deviceId: playback.device?.id || null, at: Date.now() };
     state.activeIndex = inMix;
     state.remotePlayback = true;
     expectSpotifyState({ uri: playback.item.uri, isPlaying: true });
