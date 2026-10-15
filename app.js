@@ -33,7 +33,9 @@ const storageKeys = {
   seeds: "sideb-seeds-v1",
   pickMode: "sideb-pick-mode-v1",
   likedTracks: "sideb-liked-tracks-v1",
-  savedUpdatedAt: "sideb-saved-updated-v1"
+  savedUpdatedAt: "sideb-saved-updated-v1",
+  nowPlaying: "sideb-now-playing-v1",
+  listenSession: "sideb-listen-session-v1"
 };
 const spotifyTokenKey = "sideb-spotify-session-v1";
 const spotifyScopes = [
@@ -156,6 +158,15 @@ function listenedSeconds(track) {
   return state.listenSession?.trackId === track?.id ? state.listenSession.listened : 0;
 }
 
+// Saved every few seconds so a refresh can carry on counting; a failed save just means that song starts over.
+function saveListenSession(session) {
+  try {
+    localStorage.setItem(storageKeys.listenSession, JSON.stringify(session));
+  } catch (error) {
+    console.error("Couldn't save listening progress.", error);
+  }
+}
+
 // Counts time actually spent listening, so seeking or resuming mid-song doesn't count as hearing it.
 function recordListening(track, positionSeconds, isPlaying) {
   const now = Date.now();
@@ -178,6 +189,7 @@ function recordListening(track, positionSeconds, isPlaying) {
     session.lastPosition = positionSeconds;
     session.lastCheckedAt = now;
   }
+  saveListenSession(session);
   if (session.counted || session.listened / track.duration < heardThreshold) return;
   session.counted = true;
   recordHeard(track);
@@ -1311,6 +1323,7 @@ function removeTrackFromMix(index) {
 let spotifySyncTimer = null;
 function queueSpotifySync() {
   if (!state.remotePlayback) return;
+  rememberNowPlaying();
   window.clearTimeout(spotifySyncTimer);
   spotifySyncTimer = window.setTimeout(() => {
     spotifySkips = spotifySkips.then(syncSpotifyQueue).catch((error) => {
@@ -2187,8 +2200,57 @@ document.addEventListener("visibilitychange", () => {
   if (Date.now() - lastCatchUpAt > 60_000) void catchUpPlayHistory();
   if (state.remotePlayback) {
     void pollSpotifyPlayback().catch((error) => console.error("Spotify progress refresh failed.", error));
+  } else {
+    void resumeSpotifyFollowing().catch((error) => console.error("Couldn't check what Spotify is playing.", error));
   }
 });
+
+// The mix Spotify is playing, kept so a refresh (or a phone reopening the page) shows it again instead of a new mix.
+function rememberNowPlaying() {
+  writeStorage(storageKeys.nowPlaying, {
+    tracks: state.playlist,
+    title: $("#playlist-title").textContent,
+    kicker: $("#mix-kicker").textContent,
+    savedMixId: state.currentSavedMixId,
+    spotifyPlaylist: state.spotifyPlaylist,
+    savedAt: Date.now()
+  });
+}
+
+// If Spotify is still playing a song from the mix on screen, or from the mix that was playing before the page
+// reloaded, follow it again and keep counting that song's listening. allowRestore lets it bring back the earlier mix.
+async function resumeSpotifyFollowing({ allowRestore = false } = {}) {
+  if (!state.spotifyUser || state.remotePlayback) return false;
+  const playback = await spotifyRequest("/me/player");
+  if (!playback?.is_playing || !playback.item) return false;
+  let index = state.playlist.findIndex((track) => track.spotifyUri === playback.item.uri);
+  if (index < 0 && allowRestore) {
+    const stored = readStorage(storageKeys.nowPlaying, null);
+    const storedIndex = stored?.tracks?.findIndex((track) => track.spotifyUri === playback.item.uri) ?? -1;
+    if (storedIndex < 0 || Date.now() - stored.savedAt > 24 * 60 * 60 * 1000) return false;
+    state.playlist = stored.tracks;
+    state.spotifyPlaylist = stored.spotifyPlaylist || null;
+    state.currentSavedMixId = stored.savedMixId || null;
+    $("#playlist-title").textContent = stored.title || "Your mix";
+    if (stored.kicker) $("#mix-kicker").textContent = stored.kicker;
+    index = storedIndex;
+  }
+  if (index < 0) return false;
+  const track = state.playlist[index];
+  const session = readStorage(storageKeys.listenSession, null);
+  // The saved session carries on: recordListening only adds progress up to the time that really passed.
+  if (session?.trackId === track.id) state.listenSession = session;
+  state.activeIndex = index;
+  state.remotePlayback = true;
+  state.lastRemoteTrackId = track.id;
+  state.lastSpotifyPlayback = { isPlaying: true, deviceId: playback.device?.id || null, at: Date.now() };
+  showPlayingState(true);
+  updateSpotifyUi();
+  renderPlaylist();
+  await pollSpotifyPlayback().catch((error) => console.error("Spotify progress refresh failed.", error));
+  startFollowingSpotify();
+  return true;
+}
 
 async function startSpotifyPlayback(index, playlistUri = null, step = 1) {
   if (!state.spotifyUser) throw new Error("Connect Spotify before starting full-track playback.");
@@ -2225,7 +2287,9 @@ async function startSpotifyPlayback(index, playlistUri = null, step = 1) {
   state.elapsed = 0;
   // Side B started this song from 0:00, so count from now even if the page is backgrounded before Spotify confirms it.
   state.listenSession = { trackId: track.id, listened: 0, lastPosition: 0, lastCheckedAt: Date.now() };
+  saveListenSession(state.listenSession);
   state.remotePlayback = true;
+  rememberNowPlaying();
   state.lastRemoteTrackId = track.id;
   expectSpotifyState({ uri: track.spotifyUri, isPlaying: true });
   showPlayingState(true);
@@ -3177,7 +3241,12 @@ async function initializeSpotify() {
     selectPeriod(state.period);
     await cleanUpPicks().catch((error) => console.error("Couldn't match your picks on Spotify.", error));
     await catchUpPlayHistory();
-    await buildMix();
+    const resumed = await resumeSpotifyFollowing({ allowRestore: true }).catch((error) => {
+      console.error("Couldn't check what Spotify is playing.", error);
+      return false;
+    });
+    if (resumed) showToast("Spotify is still playing your mix, so Side B picked it back up.");
+    else await buildMix();
   } catch (error) {
     state.spotifyConnecting = false;
     state.spotifyError = error.message;
