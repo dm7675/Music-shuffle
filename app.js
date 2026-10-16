@@ -75,6 +75,8 @@ const state = {
   lastSpotifyPlayback: null,
   // Spotify is on a song that isn't in the mix (past its end, or from Spotify's own queue).
   outsideMix: false,
+  // That song, so skipping it early holds it back like a mix song.
+  outsideTrack: null,
   currentSavedMixId: null,
   currentView: "mix",
   spotifyUser: null,
@@ -2379,30 +2381,35 @@ function isStaleSpotifyReport(playback) {
 // Spotify moved on to the next song because of the car, headphones or the Spotify app, not Side B's Next button
 // (that one judges the song itself before Side B sees the change). Judge it the same way, but only when Side B was
 // watching closely: after a long gap, such as the screen being off, the Spotify history catch-up decides instead.
-function judgeOutsideSkip(previous, previousIndex, newIndex) {
+// A mix song only counts as skipped when Spotify moved to the next mix song, not when you picked another one.
+function judgeOutsideSkip(previous, movedToNext = true) {
   const session = state.listenSession;
   if (!session || session.trackId !== previous.id || session.counted) return;
   const secondsSinceLastCheck = (Date.now() - session.lastCheckedAt) / 1000;
   const playedToEnd = session.lastPosition + secondsSinceLastCheck >= previous.duration - 3;
-  if (secondsSinceLastCheck > 10 || playedToEnd || newIndex !== playableIndexFrom(previousIndex + 1)) return;
+  if (secondsSinceLastCheck > 10 || playedToEnd || !movedToNext) return;
   holdSkippedTrack(previous, session.lastPosition);
 }
 
 // Spotify is playing a song that isn't in the mix: past the end of the mix, or from Spotify's own queue. Show it
-// and keep watching, so Side B picks the mix back up when Spotify returns to it. Songs outside the mix aren't counted.
+// and keep watching, so Side B picks the mix back up when Spotify returns to it. These songs are counted like mix
+// songs: heard past 60%, held back when skipped before it.
 function showOutsideSong(playback) {
   const item = playback.item;
   if (!state.outsideMix) {
-    state.outsideMix = true;
     showToast(`Spotify is playing "${item.name}", which isn't in this mix. Side B will pick the mix back up when Spotify returns to it.`);
   }
-  // Time on this song isn't listening to the mix song from before.
-  if (state.listenSession) {
-    state.listenSession.lastPosition = 1e9;
-    state.listenSession.lastCheckedAt = Date.now();
-  }
+  // Podcasts and local files can't be held back.
+  const track = item.type === "track" && !item.is_local && item.duration_ms ? fromSpotifyTrack(item, 0, "discovery") : null;
+  const previous = state.outsideMix ? state.outsideTrack : null;
+  if (previous && previous.id !== track?.id) judgeOutsideSkip(previous);
+  state.outsideMix = true;
+  state.outsideTrack = track;
   const duration = (item.duration_ms || 0) / 1000;
   state.elapsed = Math.floor((playback.progress_ms || 0) / 1000);
+  // Starts a new listening session, so time on this song isn't counted for the mix song from before.
+  if (track) recordListening(track, state.elapsed, Boolean(playback.is_playing));
+  else state.listenSession = null;
   $("#player-track").textContent = item.name;
   $("#player-artist").textContent = (item.artists || []).map((artist) => artist.name).join(", ") || "Not in this mix";
   $("#duration-time").textContent = formatTime(duration);
@@ -2431,7 +2438,8 @@ async function pollSpotifyPlayback() {
   const wasCounted = Boolean(state.listenSession?.counted);
   state.activeIndex = state.playlist.indexOf(track);
   const previous = state.playlist[previousIndex];
-  if (previous && previous !== track && !wasOutside) judgeOutsideSkip(previous, previousIndex, state.activeIndex);
+  if (wasOutside && state.outsideTrack) judgeOutsideSkip(state.outsideTrack);
+  else if (previous && previous !== track) judgeOutsideSkip(previous, state.activeIndex === playableIndexFrom(previousIndex + 1));
   state.lastRemoteTrackId = track.id;
   state.elapsed = Math.floor((playback.progress_ms || 0) / 1000);
   $("#player-track").textContent = track.title;
@@ -2550,8 +2558,8 @@ async function skipSpotifyTrack() {
   } catch (error) {
     console.error("Couldn't refresh Spotify progress before skipping.", error);
   }
-  const track = state.playlist[state.activeIndex];
-  if (track && !state.outsideMix) holdSkippedTrack(track, state.elapsed);
+  const track = state.outsideMix ? state.outsideTrack : state.playlist[state.activeIndex];
+  if (track) holdSkippedTrack(track, state.elapsed);
   await startSpotifyPlayback((state.activeIndex + 1) % state.playlist.length);
 }
 
@@ -2569,8 +2577,9 @@ function previousTrack() {
   } else if (state.playlist.length) {
     if (state.remotePlayback && state.activeIndex >= 0) {
       void state.webPlayer?.activateElement?.();
-      // From a song outside the mix, Previous goes back to the last mix song that played.
+      // From a song outside the mix, Previous goes back to the last mix song that played, moving on from this one.
       const back = state.outsideMix ? 0 : 1;
+      if (state.outsideMix && state.outsideTrack) holdSkippedTrack(state.outsideTrack, state.elapsed);
       spotifySkips = spotifySkips
         .then(() => startSpotifyPlayback((state.activeIndex - back + state.playlist.length) % state.playlist.length, null, -1))
         .catch((error) => {
