@@ -31,6 +31,7 @@ function sanitizeTrack(track) {
   if (!id || !title || !artist || !Number.isFinite(duration) || duration <= 0 || duration > 7200) return null;
   const spotifyUri = boundedString(track.spotifyUri, 200);
   const spotifyUrl = boundedString(track.spotifyUrl, 300);
+  const image = boundedString(track.image, 300);
   return {
     id,
     title,
@@ -39,6 +40,7 @@ function sanitizeTrack(track) {
     duration: Math.round(duration),
     spotifyUri: spotifyUri?.startsWith("spotify:track:") ? spotifyUri : undefined,
     spotifyUrl: spotifyUrl?.startsWith("https://open.spotify.com/") ? spotifyUrl : undefined,
+    image: /^https:\/\/i\.scdn\.co\/image\/[A-Za-z0-9]+$/.test(image || "") ? image : undefined,
     type: track.type === "familiar" ? "familiar" : "discovery"
   };
 }

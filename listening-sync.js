@@ -20,6 +20,8 @@ function trackFromSpotify(item) {
     title: item.name,
     artist: (item.artists || []).map((artist) => artist.name).join(", "),
     album: item.album?.name,
+    // The 300 px album art (Spotify usually offers 640, 300 and 64).
+    image: (item.album?.images || []).find((image) => image.width >= 100 && image.width <= 300)?.url || item.album?.images?.[0]?.url,
     duration: item.duration_ms / 1000,
     spotifyUri: item.uri,
     spotifyUrl: item.external_urls?.spotify,
